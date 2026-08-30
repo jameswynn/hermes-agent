@@ -165,3 +165,68 @@ def test_no_refresh_when_session_replaced(monkeypatch):
         assert emitted == []
     finally:
         server._sessions.pop(sid, None)
+
+
+def test_late_refresh_worker_keeps_the_sessions_profile_scope(monkeypatch, tmp_path):
+    """The refresh thread must run under the SESSION's profile, not the launch one.
+
+    ``_schedule_mcp_late_refresh`` is called from the deferred build thread,
+    which has the session profile's ``HERMES_HOME`` override and secret scope
+    installed. ContextVars do not cross into a bare ``threading.Thread``, so
+    without an explicit replay the worker ran under the launch profile — and
+    every question it asks is then asked about the wrong profile: which
+    discovery thread to join (``_thread_for_current_profile`` keys on the
+    ambient home) and which registry ``refresh_agent_mcp_tools`` reads. On a
+    multiplexed desktop gateway that either finds nothing or splices another
+    profile's MCP tools into this session's agent.
+    """
+    from agent.secret_scope import current_secret_scope, set_secret_scope, reset_secret_scope
+    from hermes_constants import (
+        get_hermes_home,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    profile_home = tmp_path / "carol"
+    profile_home.mkdir()
+    (profile_home / ".env").write_text("TOOLHIVE_TOKEN=carol-only\n", encoding="utf-8")
+
+    seen: dict = {}
+
+    base = [_tool("read_file")]
+    full = base + [_tool("mcp__toolhive__ping")]
+    agent = _make_fake_agent(base)
+    sid = "sess-late-scope"
+    server._sessions[sid] = {"agent": agent}
+
+    home_token = None
+    secret_token = None
+    try:
+        emitted = _install(monkeypatch, in_flight=True, join_result=True, new_defs=full)
+
+        def _observing_join(timeout=None):
+            seen["home"] = str(get_hermes_home())
+            scope = current_secret_scope()
+            seen["secret_scope"] = dict(scope) if scope else None
+            return True
+
+        monkeypatch.setattr(entry, "join_mcp_discovery", _observing_join)
+
+        # Stand in for the deferred build thread's bound profile scope.
+        home_token = set_hermes_home_override(str(profile_home))
+        secret_token = set_secret_scope({"TOOLHIVE_TOKEN": "carol-only"})
+
+        server._schedule_mcp_late_refresh(sid, agent)
+        _drain_refresh_threads()
+    finally:
+        if secret_token is not None:
+            reset_secret_scope(secret_token)
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
+        server._sessions.pop(sid, None)
+
+    assert seen.get("home") == str(profile_home), (
+        "the late-refresh worker ran under the launch profile's HERMES_HOME"
+    )
+    assert seen.get("secret_scope") == {"TOOLHIVE_TOKEN": "carol-only"}
+    assert ("session.info", sid, {"tools_len": 2}) in emitted

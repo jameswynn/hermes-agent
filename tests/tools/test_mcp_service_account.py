@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -1016,6 +1017,149 @@ class TestConcurrentRefresh:
         assert exchange_count[0] == 1
 
 
+class TestRefreshLockAcrossEventLoops:
+    """The refresh lock must survive MCP event-loop teardown/recreation.
+
+    ``asyncio.Lock`` binds to the loop of its FIRST acquire and raises
+    ``RuntimeError: ... is bound to a different event loop`` on any later
+    acquire from another loop.  The MCP loop is genuinely recreated in
+    normal operation (``_stop_mcp_loop_if_idle`` after a probe, a gateway
+    restart), so a lock table keyed only by ``(home, server)`` hands the new
+    loop a lock owned by the dead one and every token refresh raises.
+    """
+
+    def _lock(self, tmp_path):
+        from tools.mcp_service_account import _get_refresh_lock
+
+        return _get_refresh_lock("srv\x00identity", str(tmp_path))
+
+    async def _contend(self, tmp_path):
+        """Acquire the lock *with a waiter*, which is what binds it to a loop.
+
+        ``asyncio.Lock.acquire`` only touches ``_get_loop()`` on the waiter
+        path, so an uncontended acquire never binds — the cross-loop
+        ``RuntimeError`` appears the first time two coroutines actually
+        contend, i.e. exactly the refresh storm the lock exists to dedupe.
+        """
+        lock = self._lock(tmp_path)
+        await lock.acquire()
+        waiter = asyncio.create_task(lock.acquire())
+        await asyncio.sleep(0)
+        lock.release()
+        await waiter
+        lock.release()
+        return True
+
+    def test_contended_lock_survives_loop_recreation(self, tmp_path):
+        from tools.mcp_service_account import _clear_refresh_locks_for_tests
+
+        _clear_refresh_locks_for_tests()
+
+        assert asyncio.run(self._contend(tmp_path)) is True
+        # Second run == brand new event loop, same process, same lock key.
+        assert asyncio.run(self._contend(tmp_path)) is True
+
+    def test_lock_held_when_its_loop_dies_does_not_wedge_the_next_loop(
+        self, tmp_path
+    ):
+        """A lock left acquired on a dead loop must not block forever."""
+        from tools.mcp_service_account import _clear_refresh_locks_for_tests
+
+        _clear_refresh_locks_for_tests()
+
+        async def _acquire_and_abandon():
+            await self._lock(tmp_path).acquire()  # deliberately never released
+
+        asyncio.run(_acquire_and_abandon())
+
+        async def _use_after():
+            async with self._lock(tmp_path):
+                return True
+
+        assert asyncio.run(asyncio.wait_for(_use_after(), timeout=2)) is True
+
+    def test_same_loop_still_shares_one_lock(self, tmp_path):
+        """Per-loop scoping must not silently disable refresh dedup."""
+        from tools.mcp_service_account import _clear_refresh_locks_for_tests
+
+        _clear_refresh_locks_for_tests()
+
+        async def _check():
+            first = self._lock(tmp_path)
+            second = self._lock(tmp_path)
+            assert first is second
+            # And distinct keys still get distinct locks.
+            from tools.mcp_service_account import _get_refresh_lock
+
+            assert _get_refresh_lock("other\x00identity", str(tmp_path)) is not first
+
+        asyncio.run(_check())
+
+    @pytest.mark.asyncio
+    async def test_contention_after_loop_recreation_still_dedupes(
+        self, tmp_path, monkeypatch
+    ):
+        """Full ``_acquire_token`` contention on a *second* loop.
+
+        ``pytest.mark.asyncio`` gives this test its own loop, and the
+        synchronous warm-up below runs the same key on a different one — so
+        this exercises exchange dedup on a recreated loop rather than on the
+        loop that first minted the lock.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("TEST_SA_PASSWORD", "pw")
+
+        from tools.mcp_service_account import (
+            ServiceAccountAuth,
+            _clear_refresh_locks_for_tests,
+        )
+
+        _clear_refresh_locks_for_tests()
+        cfg = _make_sa_config()
+
+        # Warm the lock table on a throwaway loop first. This test already
+        # owns a running loop (pytest.mark.asyncio), so the throwaway
+        # ``asyncio.run`` has to happen on ANOTHER thread — calling it here
+        # would raise "cannot be called from a running event loop" and leak
+        # the un-awaited coroutine as a RuntimeWarning.
+        def _warm():
+            result: list[bool] = []
+
+            def _thread_body():
+                async def _inner():
+                    auth = ServiceAccountAuth("srv", cfg, hermes_home=tmp_path)
+                    async with auth._refresh_lock:
+                        return True
+
+                result.append(asyncio.run(_inner()))
+
+            t = threading.Thread(target=_thread_body)
+            t.start()
+            t.join()
+            return result == [True]
+
+        assert _warm() is True
+
+        exchange_count = [0]
+
+        async def _slow_exchange(self_inner, http_client):
+            exchange_count[0] += 1
+            await asyncio.sleep(0.01)
+            return _parse_token("SHARED_TOK")
+
+        async def _run_one():
+            auth = ServiceAccountAuth("srv", cfg, hermes_home=tmp_path)
+            return await auth._acquire_token(MagicMock())
+
+        with patch.object(
+            ServiceAccountAuth, "_exchange_service_account", _slow_exchange
+        ):
+            tokens = await asyncio.gather(*[_run_one() for _ in range(5)])
+
+        assert exchange_count[0] == 1
+        assert {t.access_token for t in tokens} == {"SHARED_TOK"}
+
+
 # ---------------------------------------------------------------------------
 # Error cases
 # ---------------------------------------------------------------------------
@@ -1552,3 +1696,423 @@ class TestProfileSecretScopeIsolation:
         # Modes must be 0600
         assert (path_a.stat().st_mode & 0o777) == 0o600
         assert (path_b.stat().st_mode & 0o777) == 0o600
+
+
+# ---------------------------------------------------------------------------
+# Malformed on-disk state must fail safe, never opaquely
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedTokenCache:
+    """A corrupt cache file must read as "no cached token", not as a crash.
+
+    The cache is ordinary on-disk state: a half-written file, a restored
+    backup, a sync client, or an editor can leave it in any shape. It is read
+    on the MCP connect path, so an escaping ``AttributeError`` /
+    ``UnicodeDecodeError`` surfaced as an opaque server failure — the server
+    never connects and the error names neither the file nor the cause, when
+    the correct behaviour is simply to mint a fresh token.
+    """
+
+    def _auth(self, tmp_path):
+        from tools.mcp_service_account import ServiceAccountAuth
+
+        return ServiceAccountAuth("srv", _make_sa_config(), hermes_home=tmp_path)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "[1, 2, 3]",          # JSON array
+            '"just-a-string"',    # JSON string
+            "null",               # JSON null
+            "42",                 # JSON number
+            "true",               # JSON bool
+            "{not json at all",   # invalid JSON
+            "",                   # empty file
+        ],
+        ids=["array", "string", "null", "number", "bool", "invalid", "empty"],
+    )
+    def test_non_mapping_cache_reads_as_miss(self, tmp_path, payload):
+        auth = self._auth(tmp_path)
+        auth._cache_path.parent.mkdir(parents=True, exist_ok=True)
+        auth._cache_path.write_text(payload, encoding="utf-8")
+
+        assert auth._load_from_disk() is None
+        assert auth._get_cached_token() is None
+
+    def test_binary_cache_reads_as_miss(self, tmp_path):
+        """``read_text`` raises UnicodeDecodeError, which is not a JSONDecodeError."""
+        auth = self._auth(tmp_path)
+        auth._cache_path.parent.mkdir(parents=True, exist_ok=True)
+        auth._cache_path.write_bytes(b"\xff\xfe\x00\x01binary junk")
+
+        assert auth._load_from_disk() is None
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {"access_token": {"nested": 1}, "expires_at": 9999999999},
+            {"access_token": ["a"], "expires_at": 9999999999},
+            {"access_token": 12345, "expires_at": 9999999999},
+        ],
+        ids=["dict", "list", "int"],
+    )
+    def test_non_string_access_token_is_rejected(self, tmp_path, data):
+        """``str(...)``-coercing would send a garbage Bearer header upstream."""
+        import json as _json
+
+        auth = self._auth(tmp_path)
+        auth._cache_path.parent.mkdir(parents=True, exist_ok=True)
+        data = dict(data, identity=auth._identity)
+        auth._cache_path.write_text(_json.dumps(data), encoding="utf-8")
+
+        assert auth._load_from_disk() is None
+
+    def test_non_string_refresh_token_is_rejected(self, tmp_path):
+        """A non-string refresh token would go out as a form field verbatim."""
+        import json as _json
+
+        auth = self._auth(tmp_path)
+        auth._cache_path.parent.mkdir(parents=True, exist_ok=True)
+        auth._cache_path.write_text(
+            _json.dumps(
+                {
+                    "access_token": "TOK",
+                    "expires_at": 9999999999,
+                    "refresh_token": {"evil": True},
+                    "identity": auth._identity,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        assert auth._load_from_disk() is None
+
+    def test_from_dict_rejects_non_mapping(self):
+        from tools.mcp_service_account import _CachedToken
+
+        for bad in ([], "x", 3, None, ()):
+            assert _CachedToken.from_dict(bad) is None
+
+    @pytest.mark.asyncio
+    async def test_malformed_cache_still_mints_a_fresh_token(
+        self, tmp_path, monkeypatch
+    ):
+        """End to end: a corrupt cache degrades to a normal exchange."""
+        monkeypatch.setenv("TEST_SA_PASSWORD", "pw")
+        from tools.mcp_service_account import (
+            ServiceAccountAuth,
+            _clear_refresh_locks_for_tests,
+        )
+
+        _clear_refresh_locks_for_tests()
+        auth = ServiceAccountAuth("srv", _make_sa_config(), hermes_home=tmp_path)
+        auth._cache_path.parent.mkdir(parents=True, exist_ok=True)
+        auth._cache_path.write_text("[]", encoding="utf-8")
+
+        async def _exchange(self_inner, http_client):
+            return _parse_token("FRESH")
+
+        with patch.object(
+            ServiceAccountAuth, "_exchange_service_account", _exchange
+        ):
+            token = await auth._acquire_token(MagicMock())
+
+        assert token.access_token == "FRESH"
+
+    def test_identity_fingerprint_rejects_non_mapping(self):
+        """Coercing to ``{}`` would give every malformed config ONE cache path."""
+        from tools.mcp_service_account import sa_identity_fingerprint
+
+        for bad in (None, "x", [], 3):
+            with pytest.raises(TypeError):
+                sa_identity_fingerprint(bad)
+
+
+class TestTokenCleanupIdentity:
+    """``remove_service_account_tokens`` must delete only what it owns.
+
+    The old prefix sweep (``<safe-name>-*.json`` plus an unconditional
+    ``<safe-name>-sa.json``) collided two ways, both reachable with ordinary
+    server names.
+    """
+
+    def _write(self, path, payload):
+        import json as _json
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_sibling_server_token_is_not_deleted(self, tmp_path):
+        """``_safe_filename`` keeps ``-``, so ``foo-*`` matched ``foo-bar-…``."""
+        from tools.mcp_service_account import (
+            _get_sa_token_path,
+            remove_service_account_tokens,
+            sa_identity_fingerprint,
+        )
+
+        cfg = _make_sa_config()
+        ident = sa_identity_fingerprint(cfg)
+        mine = self._write(
+            _get_sa_token_path("foo", tmp_path, ident),
+            {"access_token": "MINE", "expires_at": 1, "identity": ident},
+        )
+        sibling = self._write(
+            _get_sa_token_path("foo-bar", tmp_path, ident),
+            {"access_token": "SIBLING", "expires_at": 1, "identity": ident},
+        )
+
+        remove_service_account_tokens("foo", hermes_home=tmp_path)
+
+        assert not mine.exists()
+        assert sibling.exists(), (
+            "removing server 'foo' deleted sibling server 'foo-bar''s token"
+        )
+
+    def test_browser_oauth_cache_of_a_sibling_is_not_deleted(self, tmp_path):
+        """``mcp-tokens/foo-sa.json`` IS browser OAuth's path for ``foo-sa``."""
+        from tools.mcp_oauth import _get_token_dir
+        from tools.mcp_service_account import remove_service_account_tokens
+
+        oauth = self._write(
+            _get_token_dir(tmp_path) / "foo-sa.json",
+            {
+                "access_token": "OAUTH",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": "R",
+            },
+        )
+
+        remove_service_account_tokens("foo", hermes_home=tmp_path)
+
+        assert oauth.exists(), (
+            "removing service-account server 'foo' logged the unrelated "
+            "OAuth server 'foo-sa' out"
+        )
+
+    def test_legacy_service_account_file_is_still_cleaned(self, tmp_path):
+        """The shape check must not turn the legacy sweep into a no-op."""
+        from tools.mcp_oauth import _get_token_dir
+        from tools.mcp_service_account import remove_service_account_tokens
+
+        legacy = self._write(
+            _get_token_dir(tmp_path) / "foo-sa.json",
+            {"access_token": "OLD", "expires_at": 1, "issued_at": 0},
+        )
+
+        remove_service_account_tokens("foo", hermes_home=tmp_path)
+
+        assert not legacy.exists()
+
+    def test_every_identity_for_this_server_is_removed(self, tmp_path):
+        from tools.mcp_service_account import (
+            _get_sa_token_path,
+            remove_service_account_tokens,
+            sa_identity_fingerprint,
+        )
+
+        paths = []
+        for username in ("zug", "carol", "anton"):
+            cfg = _make_sa_config(username=username)
+            ident = sa_identity_fingerprint(cfg)
+            paths.append(
+                self._write(
+                    _get_sa_token_path("toolhive", tmp_path, ident),
+                    {"access_token": "T", "expires_at": 1, "identity": ident},
+                )
+            )
+        assert len({p.name for p in paths}) == 3
+
+        remove_service_account_tokens("toolhive", hermes_home=tmp_path)
+
+        assert not any(p.exists() for p in paths)
+
+    def test_pinned_identity_removes_only_that_one(self, tmp_path):
+        from tools.mcp_service_account import (
+            _get_sa_token_path,
+            remove_service_account_tokens,
+            sa_identity_fingerprint,
+        )
+
+        keep_cfg = _make_sa_config(username="carol")
+        drop_cfg = _make_sa_config(username="zug")
+        keep = self._write(
+            _get_sa_token_path(
+                "toolhive", tmp_path, sa_identity_fingerprint(keep_cfg)
+            ),
+            {"access_token": "K", "expires_at": 1},
+        )
+        drop = self._write(
+            _get_sa_token_path(
+                "toolhive", tmp_path, sa_identity_fingerprint(drop_cfg)
+            ),
+            {"access_token": "D", "expires_at": 1},
+        )
+
+        remove_service_account_tokens(
+            "toolhive", hermes_home=tmp_path, sa_config=drop_cfg
+        )
+
+        assert keep.exists()
+        assert not drop.exists()
+
+    def test_unverifiable_file_is_left_in_place(self, tmp_path):
+        """Two names can sanitize to one ``<safe>``; an unreadable owner is unknown."""
+        from tools.mcp_service_account import (
+            _get_sa_token_dir,
+            remove_service_account_tokens,
+        )
+
+        token_dir = _get_sa_token_dir(tmp_path)
+        token_dir.mkdir(parents=True, exist_ok=True)
+        corrupt = token_dir / ("foo-" + "a" * 16 + ".json")
+        corrupt.write_text("{not json", encoding="utf-8")
+
+        remove_service_account_tokens("foo", hermes_home=tmp_path)
+
+        assert corrupt.exists()
+
+    def test_non_mapping_sa_config_does_not_raise(self, tmp_path):
+        """A malformed pin degrades to the verified sweep, never a TypeError."""
+        from tools.mcp_service_account import (
+            _get_sa_token_path,
+            remove_service_account_tokens,
+            sa_identity_fingerprint,
+        )
+
+        ident = sa_identity_fingerprint(_make_sa_config())
+        mine = self._write(
+            _get_sa_token_path("toolhive", tmp_path, ident),
+            {"access_token": "T", "expires_at": 1, "identity": ident},
+        )
+
+        remove_service_account_tokens(
+            "toolhive", hermes_home=tmp_path, sa_config="not-a-mapping"
+        )
+
+        assert not mine.exists()
+
+    def test_missing_token_dir_is_a_no_op(self, tmp_path):
+        from tools.mcp_service_account import remove_service_account_tokens
+
+        remove_service_account_tokens("never-existed", hermes_home=tmp_path)
+
+
+class TestTokenClientLifetime:
+    """The token-endpoint client is built only when an exchange happens.
+
+    ``async_auth_flow`` runs on EVERY MCP request. It used to open (and tear
+    down) a dedicated ``AsyncClient`` — connection pool plus TLS context —
+    around the whole flow, including the overwhelmingly common case where the
+    cached token is still valid and no token-endpoint request is made at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_valid_cached_token_builds_no_client(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TEST_SA_PASSWORD", "pw")
+        from tools.mcp_service_account import (
+            ServiceAccountAuth,
+            _clear_refresh_locks_for_tests,
+        )
+
+        _clear_refresh_locks_for_tests()
+        auth = ServiceAccountAuth("srv", _make_sa_config(), hermes_home=tmp_path)
+        auth._mem_token = _parse_token("CACHED", expires_in=3600)
+
+        built: list[int] = []
+        monkeypatch.setattr(
+            ServiceAccountAuth,
+            "_token_client",
+            lambda self: built.append(1) or _FakeHttpxClient([]),
+        )
+
+        req = MagicMock()
+        req.headers = {}
+        gen = auth.async_auth_flow(req)
+        await gen.__anext__()
+        resp = MagicMock()
+        resp.status_code = 200
+        with pytest.raises(StopAsyncIteration):
+            await gen.asend(resp)
+
+        assert req.headers["Authorization"] == "Bearer CACHED"
+        assert built == [], (
+            "an HTTP client was constructed for a request that needed no "
+            "token exchange"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cold_cache_still_builds_one_client(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TEST_SA_PASSWORD", "pw")
+        from tools.mcp_service_account import (
+            ServiceAccountAuth,
+            _clear_refresh_locks_for_tests,
+        )
+
+        _clear_refresh_locks_for_tests()
+        auth = ServiceAccountAuth("srv", _make_sa_config(), hermes_home=tmp_path)
+
+        built: list[int] = []
+        monkeypatch.setattr(
+            ServiceAccountAuth,
+            "_token_client",
+            lambda self: built.append(1) or _FakeHttpxClient([]),
+        )
+
+        async def _exchange(self_inner, http_client):
+            return _parse_token("FRESH")
+
+        with patch.object(
+            ServiceAccountAuth, "_exchange_service_account", _exchange
+        ):
+            req = MagicMock()
+            req.headers = {}
+            gen = auth.async_auth_flow(req)
+            await gen.__anext__()
+            resp = MagicMock()
+            resp.status_code = 200
+            with pytest.raises(StopAsyncIteration):
+                await gen.asend(resp)
+
+        assert req.headers["Authorization"] == "Bearer FRESH"
+        assert built == [1]
+
+    @pytest.mark.asyncio
+    async def test_401_retry_always_opens_a_client(self, tmp_path, monkeypatch):
+        """The rejected token is cached; the retry must not re-send it."""
+        monkeypatch.setenv("TEST_SA_PASSWORD", "pw")
+        from tools.mcp_service_account import (
+            ServiceAccountAuth,
+            _clear_refresh_locks_for_tests,
+        )
+
+        _clear_refresh_locks_for_tests()
+        auth = ServiceAccountAuth("srv", _make_sa_config(), hermes_home=tmp_path)
+        auth._mem_token = _parse_token("STALE", expires_in=3600)
+
+        built: list[int] = []
+        monkeypatch.setattr(
+            ServiceAccountAuth,
+            "_token_client",
+            lambda self: built.append(1) or _FakeHttpxClient([]),
+        )
+
+        async def _exchange(self_inner, http_client):
+            return _parse_token("RENEWED")
+
+        with patch.object(
+            ServiceAccountAuth, "_exchange_service_account", _exchange
+        ):
+            req = MagicMock()
+            req.headers = {}
+            gen = auth.async_auth_flow(req)
+            await gen.__anext__()
+            assert req.headers["Authorization"] == "Bearer STALE"
+            unauthorized = MagicMock()
+            unauthorized.status_code = 401
+            await gen.asend(unauthorized)
+
+        assert req.headers["Authorization"] == "Bearer RENEWED"
+        assert built == [1], "the 401 retry did not open a token client"

@@ -32,14 +32,32 @@ _mcp_discovery_thread: Optional[threading.Thread] = None
 
 
 class _ProfileDiscovery:
-    """Background-discovery coordinator state owned by exactly one profile."""
+    """Background-discovery coordinator state owned by exactly one profile.
 
-    __slots__ = ("home", "started", "thread")
+    ``lock`` serializes the *decision* to spawn (the config probe, the
+    populated-registry probe, and the thread install) for THIS profile only.
+    It exists so those steps no longer run under the module-global
+    ``_mcp_discovery_lock``: they read ``config.yaml`` from disk and import
+    the MCP SDK stack, and holding a process-wide lock across that blocked
+    every other profile — including the per-turn ``mcp_discovery_in_flight()``
+    probe on the gateway's hot path, which needs the global lock only to read
+    one dict entry.
+
+    Lock order is always ``lock`` → ``_mcp_discovery_lock`` and never the
+    reverse; no code path takes a profile lock while holding the global one.
+    """
+
+    __slots__ = ("home", "started", "thread", "lock", "evaluating")
 
     def __init__(self, home: str) -> None:
         self.home = home
         self.started = False
         self.thread: Optional[threading.Thread] = None
+        self.lock = threading.Lock()
+        # True while a caller is between "decided to look" and "installed a
+        # thread". Keeps the pruner from evicting a state that is mid-decision
+        # (its ``thread`` is still None, so it would otherwise look finished).
+        self.evaluating = False
 
 
 # canonical profile key -> that profile's coordinator state.
@@ -68,13 +86,20 @@ def _current_profile() -> Tuple[str, str]:
 
 
 def _prune_finished_locked() -> None:
-    """Drop coordinator entries with no live thread. Caller holds the lock."""
+    """Drop coordinator entries with no live thread. Caller holds the lock.
+
+    An entry whose owner is mid-decision (``evaluating``) is kept even though
+    its ``thread`` is still ``None``: evicting it would let the next caller
+    for that profile build a SECOND ``_ProfileDiscovery`` with its own lock,
+    and the two would each spawn a discovery thread for the same profile.
+    """
     if len(_profile_discovery) < _PROFILE_DISCOVERY_MAX:
         return
     for key in [
         key
         for key, state in _profile_discovery.items()
-        if state.thread is None or not state.thread.is_alive()
+        if not state.evaluating
+        and (state.thread is None or not state.thread.is_alive())
     ]:
         _profile_discovery.pop(key, None)
 
@@ -178,6 +203,14 @@ def _caller_profile_scope(home_override, secret_scope):
                 pass
 
 
+# Public aliases. Any surface that hands MCP work to a bare ``threading.Thread``
+# needs exactly this capture/replay pair — ``tui_gateway.server``'s late tool
+# refresh does — and duplicating the fail-open import dance there would just be
+# a second place to get it subtly wrong.
+capture_caller_scope = _capture_caller_scope
+caller_profile_scope = _caller_profile_scope
+
+
 def discovery_threads() -> List[threading.Thread]:
     """Return every live discovery thread this module owns, across profiles.
 
@@ -279,18 +312,50 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
     "discovery already started" state with zero MCP tools. The status probe
     behind that decision reads the calling profile's registry, so one
     profile's healthy servers can no longer satisfy another profile's gate.
-    """
-    global _mcp_discovery_started, _mcp_discovery_thread
 
+    The module-global lock is held only long enough to look up that
+    coordinator; the decision itself runs under the profile's own lock. See
+    :class:`_ProfileDiscovery` for why.
+    """
     key, home = _current_profile()
 
+    # Global lock: just enough to find (or create) THIS profile's coordinator.
+    # Everything expensive below runs under that profile's own lock instead,
+    # so one profile's config read / MCP-SDK import cannot stall another
+    # profile's discovery start or its per-turn in-flight probe.
     with _mcp_discovery_lock:
         state = _profile_discovery.get(key)
         if state is None:
             _prune_finished_locked()
             state = _ProfileDiscovery(home)
             _profile_discovery[key] = state
+        # Claimed before releasing the global lock so the pruner cannot evict
+        # this entry between here and acquiring ``state.lock``.
+        state.evaluating = True
 
+    try:
+        _start_discovery_for_profile(
+            state, home, logger=logger, thread_name=thread_name
+        )
+    finally:
+        with _mcp_discovery_lock:
+            state.evaluating = False
+
+
+def _start_discovery_for_profile(
+    state: "_ProfileDiscovery", home: str, *, logger, thread_name: str
+) -> None:
+    """Decide and spawn for ONE profile, holding only that profile's lock.
+
+    Split out of :func:`start_background_mcp_discovery` so the blocking parts
+    of the decision — ``_has_configured_mcp_servers`` (reads ``config.yaml``)
+    and ``_profile_mcp_is_populated`` (imports ``tools.mcp_tool`` and takes
+    its registry lock) — happen off the module-global lock. Same-profile
+    callers still serialize here, so the dedup guarantee is unchanged.
+    """
+    global _mcp_discovery_started, _mcp_discovery_thread
+
+    with state.lock:
         if state.started:
             thread = state.thread
             if thread is not None and thread.is_alive():
@@ -370,6 +435,16 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
                     # Identity-checked: a retry may already have installed a
                     # newer thread for this profile, and the legacy mirror may
                     # belong to a different profile entirely.
+                    #
+                    # ``state.thread`` is written here under the GLOBAL lock
+                    # but under ``state.lock`` on the spawn path. That is safe
+                    # precisely because of the identity check, not by luck: the
+                    # only interleaving is "retry installs a new thread while
+                    # the old one is exiting", and ``state.thread is me`` is
+                    # then False, so the exiting thread cannot clear a
+                    # successor. Cleanup deliberately does NOT take
+                    # ``state.lock`` — a finishing thread must never block
+                    # behind another caller's slow config/registry probe.
                     if state.thread is me:
                         state.thread = None
                     if _mcp_discovery_thread is me:

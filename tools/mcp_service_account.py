@@ -44,6 +44,34 @@ values are read at runtime via ``agent.secret_scope.get_secret`` which
 honours the active profile's isolated secret scope under multiplexing and
 falls back to ``os.environ`` in single-profile mode.
 
+Writing that block
+------------------
+Three surfaces produce it, and all three converge on
+:func:`validate_service_account_config` so none can write a block the
+runtime would later reject:
+
+- **CLI** — ``hermes mcp add <name> --url https://... --auth service_account``
+  plus ``--sa-token-url``, ``--sa-client-id``, ``--sa-username``,
+  ``--sa-password-env``, and optionally ``--sa-scope`` /
+  ``--sa-client-secret-env`` / ``--sa-grant-type``. There is deliberately no
+  flag that takes a secret VALUE, so a credential cannot reach config.yaml,
+  the shell history, or the process table.
+- **Dashboard** — ``POST /api/mcp/servers`` with a ``service_account``
+  object, modelled by ``hermes_cli.web_models.MCPServiceAccountConfig``
+  (``extra="forbid"``). Sending ``password`` or ``client_secret`` is a 422,
+  not a stored secret; read endpoints return an allowlisted summary, so a
+  key hand-added to config.yaml is never echoed back.
+- **Hand-edited config.yaml** — validated on connect, in
+  :func:`build_service_account_auth`.
+
+.. note::
+   ``grant_type`` is required. Blocks written before it became explicit
+   omit it and now fail validation on connect with
+   "service_account.grant_type is required" — add
+   ``grant_type: authentik_app_password`` to migrate. It is deliberately not
+   defaulted: inferring the Authentik extension from field presence is what
+   made the unsupported generic ``client_credentials`` case look supported.
+
 Token caching
 -------------
 Tokens are cached at
@@ -125,6 +153,7 @@ import secrets
 import stat
 import time
 import threading as _threading
+import weakref as _weakref
 from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any, Optional
@@ -367,7 +396,17 @@ def sa_identity_fingerprint(cfg: dict) -> str:
 
     ``password_env`` is an env-var NAME, never a value; nothing secret is
     hashed here, and the digest is not a secret either.
+
+    Raises ``TypeError`` for a non-mapping *cfg*. Coercing one to ``{}``
+    instead would give every malformed config the SAME fingerprint — and
+    therefore the same cache path — which is the collision this function
+    exists to prevent.
     """
+    if not isinstance(cfg, dict):
+        raise TypeError(
+            "service_account config must be a mapping to fingerprint, got "
+            f"{type(cfg).__name__}"
+        )
     material = "\x00".join(
         str(cfg.get(field, ""))
         for field in (
@@ -423,13 +462,44 @@ def _get_sa_token_path(
     return _get_sa_token_dir(hermes_home) / f"{_safe_filename(server_name)}-{digest}.json"
 
 
+#: Keys ``_CachedToken.to_dict`` can emit. Used to tell a service-account
+#: cache file apart from a browser-OAuth one that landed at the same path
+#: under the pre-``service-account/`` filename convention — an OAuth payload
+#: always carries ``token_type``/``expires_in``, neither of which is here.
+_SA_CACHE_KEYS: frozenset[str] = frozenset(
+    {"access_token", "expires_at", "issued_at", "lifetime", "refresh_token", "identity"}
+)
+
+
 def _read_token_cache(path: Path) -> dict | None:
-    if not path.exists():
-        return None
+    """Return the parsed cache mapping at *path*, or ``None``.
+
+    Fails SAFE for every malformed shape rather than propagating. The file is
+    attacker-adjacent in the weak sense that it is ordinary on-disk state a
+    backup restore, a half-written file, an editor, or a sync client can
+    corrupt — and it is read on the MCP connect path, where an escaping
+    ``AttributeError``/``UnicodeDecodeError`` surfaces as an opaque server
+    failure instead of "no cached token, mint a fresh one".
+
+    Non-mapping JSON (``[1,2,3]``, ``"nope"``, ``42``, ``null``) is rejected
+    here rather than in the caller, because ``_CachedToken.from_dict`` and
+    every other consumer assume a mapping. ``ValueError`` covers both
+    ``json.JSONDecodeError`` and the ``UnicodeDecodeError`` raised by
+    ``read_text`` on a binary file.
+    """
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        logger.debug("MCP service-account: unreadable token cache at %s", path)
         return None
+    if not isinstance(data, dict):
+        logger.debug(
+            "MCP service-account: ignoring non-mapping token cache at %s", path
+        )
+        return None
+    return data
 
 
 def _write_token_cache(path: Path, data: dict) -> None:
@@ -522,9 +592,25 @@ class _CachedToken:
 
     @classmethod
     def from_dict(cls, data: dict) -> "_CachedToken | None":
+        # Defence in depth: ``_read_token_cache`` already rejects non-mappings,
+        # but this is a public-shaped constructor and a caller that reaches it
+        # by another route must get ``None``, not an AttributeError on the
+        # connect path.
+        if not isinstance(data, dict):
+            return None
         at = data.get("access_token")
         ea = data.get("expires_at")
-        if not at or not ea:
+        # Type-check rather than ``str(...)``-coerce: a mapping or list here
+        # would stringify into a garbage ``Authorization: Bearer {...}`` header
+        # (or a garbage ``refresh_token`` form field) that gets sent to the
+        # server instead of being treated as a cache miss.
+        if not isinstance(at, str) or not at or ea is None:
+            return None
+        refresh = data.get("refresh_token")
+        if refresh is not None and not isinstance(refresh, str):
+            return None
+        identity = data.get("identity")
+        if identity is not None and not isinstance(identity, str):
             return None
         try:
             expires_at = float(ea)
@@ -533,10 +619,10 @@ class _CachedToken:
             lifetime = data.get("lifetime")
             lifetime = float(lifetime) if lifetime is not None else None
             return cls(
-                access_token=str(at),
+                access_token=at,
                 expires_at=expires_at,
-                refresh_token=data.get("refresh_token") or None,
-                identity=data.get("identity") or None,
+                refresh_token=refresh or None,
+                identity=identity or None,
                 issued_at=issued_at,
                 lifetime=lifetime,
             )
@@ -682,18 +768,50 @@ def _parse_token_response(
 # Per-server refresh deduplication
 # ---------------------------------------------------------------------------
 
-# Keyed by (hermes_home_str, server_name) → asyncio.Lock.
-_refresh_locks: dict[tuple[str, str], asyncio.Lock] = {}
+# Keyed by the RUNNING event loop, then by (hermes_home_str, server_name).
+#
+# ``asyncio.Lock`` binds to the loop of its first *contended* acquire and
+# raises ``RuntimeError: ... is bound to a different event loop`` on every
+# later acquire from another loop.  The MCP loop is genuinely recreated during
+# normal operation — ``tools.mcp_tool._stop_mcp_loop_if_idle`` tears it down
+# after a dashboard/CLI probe and the next connect builds a fresh one — so a
+# table keyed only by ``(home, server)`` hands the new loop a lock owned by the
+# dead one and every token refresh raises.  Worse, a lock still *held* when its
+# loop died stays locked forever, wedging the new loop's first refresh.
+#
+# Scoping per loop fixes both: contention is only ever meaningful between
+# coroutines on the SAME loop, so dedup is unchanged, while a new loop always
+# starts from a fresh, unlocked lock.  The outer map is weak-keyed so entries
+# for a collected loop disappear on their own — a long-lived gateway that
+# cycles the MCP loop cannot accumulate dead locks.
+_refresh_locks: "_weakref.WeakKeyDictionary[Any, dict[tuple[str, str], asyncio.Lock]]" = (
+    _weakref.WeakKeyDictionary()
+)
+# Fallback bucket for callers with no running loop. Nothing in production
+# reaches it (the sole call site is ``async with self._refresh_lock``), but an
+# unbound ``asyncio.Lock`` is still correct here: it binds on first contention.
+_refresh_locks_no_loop: dict[tuple[str, str], asyncio.Lock] = {}
 _refresh_locks_mu = _threading.Lock()
 
 
 def _get_refresh_lock(server_name: str, hermes_home: str) -> asyncio.Lock:
     key = (hermes_home, server_name)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
     with _refresh_locks_mu:
-        lock = _refresh_locks.get(key)
+        if loop is None:
+            table = _refresh_locks_no_loop
+        else:
+            table = _refresh_locks.get(loop)
+            if table is None:
+                table = {}
+                _refresh_locks[loop] = table
+        lock = table.get(key)
         if lock is None:
             lock = asyncio.Lock()
-            _refresh_locks[key] = lock
+            table[key] = lock
         return lock
 
 
@@ -701,6 +819,7 @@ def _clear_refresh_locks_for_tests() -> None:
     """Test-only: reset the global lock table."""
     with _refresh_locks_mu:
         _refresh_locks.clear()
+        _refresh_locks_no_loop.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -951,21 +1070,18 @@ class ServiceAccountAuth(_SA_AUTH_BASE):  # type: ignore[valid-type,misc]
             "use an AsyncClient, not a sync Client"
         )
 
-    async def async_auth_flow(self, request: Any):  # type: ignore[override]
-        """Inject Bearer token, handle one 401 retry.
+    def _token_client(self) -> Any:
+        """Build the short-lived client used for token-endpoint requests.
 
-        httpx drives this generator:
-          1. ``__anext__()``       → we yield the request with Authorization header
-          2. ``asend(response)``  → we inspect the response
-             - 2xx/other: generator returns → httpx uses that response
-             - 401:  invalidate cache, fetch fresh token, yield retry request
-             - ``asend(response2)`` → generator returns
+        Resolves the httpx distribution the installed MCP SDK actually uses
+        (same logic as :func:`_resolve_auth_base`) so mcp 1.x (``httpx``) and
+        mcp 2.x (``httpx2``) both work at runtime.
+
+        ``follow_redirects=False`` is a security requirement, not a default:
+        307/308 preserve the method and body, so following one would replay
+        the service-account password at whatever origin the token endpoint
+        names. :func:`_post_token_request` turns any 3xx into an error.
         """
-        # Build a small dedicated client for token-endpoint requests.  It is
-        # created fresh each auth-flow invocation so it lives only as long as
-        # a single MCP request (including one possible 401 retry).  We resolve
-        # the correct httpx module here (same logic as _resolve_auth_base) to
-        # handle both mcp 1.x (httpx) and mcp 2.x (httpx2) at runtime.
         try:
             from mcp.client import streamable_http as _transport
 
@@ -980,44 +1096,75 @@ class ServiceAccountAuth(_SA_AUTH_BASE):  # type: ignore[valid-type,misc]
             except ImportError:
                 import httpx as _httpx_mod  # type: ignore[no-redef]
 
-        # follow_redirects=False is a security requirement, not a default:
-        # 307/308 preserve the method and body, so following one would replay
-        # the service-account password at whatever origin the token endpoint
-        # names.  _post_token_request turns any 3xx into an error.
-        async with _httpx_mod.AsyncClient(follow_redirects=False) as token_client:
+        return _httpx_mod.AsyncClient(follow_redirects=False)
+
+    async def _acquire_token_with_client(self) -> _CachedToken:
+        """Return a token, opening a token-endpoint client only if needed.
+
+        The cached-token check happens BEFORE the client is built. On the
+        steady-state path — a valid token in memory or on disk — no exchange
+        happens, so constructing (and tearing down) an ``AsyncClient`` with
+        its own connection pool and TLS context on every single MCP request
+        was pure overhead. ``_acquire_token`` re-checks the cache under its
+        refresh lock, so this pre-check is an optimisation, never the
+        authority.
+        """
+        cached = self._get_cached_token()
+        if cached is not None:
+            return cached
+        async with self._token_client() as token_client:
+            return await self._acquire_token(token_client)
+
+    async def async_auth_flow(self, request: Any):  # type: ignore[override]
+        """Inject Bearer token, handle one 401 retry.
+
+        httpx drives this generator:
+          1. ``__anext__()``       → we yield the request with Authorization header
+          2. ``asend(response)``  → we inspect the response
+             - 2xx/other: generator returns → httpx uses that response
+             - 401:  invalidate cache, fetch fresh token, yield retry request
+             - ``asend(response2)`` → generator returns
+
+        Any token-endpoint client is opened and closed inside
+        ``_acquire_token_with_client``, so it lives only across an actual
+        exchange rather than across the whole MCP request.
+        """
+        token = await self._acquire_token_with_client()
+
+        # Inject Authorization header without logging the value.
+        request.headers["Authorization"] = f"Bearer {token.access_token}"
+        response = yield request
+
+        if response.status_code != 401:
+            return
+
+        # 401: invalidate and retry once.
+        #
+        # Only invalidate if the token we actually SENT is still the
+        # cached one. Under concurrency a 401 can arrive late: request A
+        # goes out on token T1, T1 expires, request B refreshes to T2, and
+        # only then does A's 401 (for T1) come back. Unconditionally
+        # clearing here would throw away the perfectly good T2 that B just
+        # minted — and every in-flight delayed 401 would do it again,
+        # producing an exchange storm where one refresh was needed. When
+        # the cache has already moved on, just retry with the current
+        # token.
+        stale = token.access_token
+        logger.debug(
+            "MCP service-account '%s': received 401, refreshing token",
+            self._server_name,
+        )
+        current = self._mem_token
+        if current is None or current.access_token == stale:
+            self._mem_token = None
+            _delete_token_cache(self._cache_path)
+
+        # Always go through a live client here: the 401 means the token we
+        # just presented is not acceptable, so a cache hit would re-send it.
+        async with self._token_client() as token_client:
             token = await self._acquire_token(token_client)
-
-            # Inject Authorization header without logging the value.
-            request.headers["Authorization"] = f"Bearer {token.access_token}"
-            response = yield request
-
-            if response.status_code != 401:
-                return
-
-            # 401: invalidate and retry once.
-            #
-            # Only invalidate if the token we actually SENT is still the
-            # cached one. Under concurrency a 401 can arrive late: request A
-            # goes out on token T1, T1 expires, request B refreshes to T2, and
-            # only then does A's 401 (for T1) come back. Unconditionally
-            # clearing here would throw away the perfectly good T2 that B just
-            # minted — and every in-flight delayed 401 would do it again,
-            # producing an exchange storm where one refresh was needed. When
-            # the cache has already moved on, just retry with the current
-            # token.
-            stale = token.access_token
-            logger.debug(
-                "MCP service-account '%s': received 401, refreshing token",
-                self._server_name,
-            )
-            current = self._mem_token
-            if current is None or current.access_token == stale:
-                self._mem_token = None
-                _delete_token_cache(self._cache_path)
-
-            token = await self._acquire_token(token_client)
-            request.headers["Authorization"] = f"Bearer {token.access_token}"
-            yield request
+        request.headers["Authorization"] = f"Bearer {token.access_token}"
+        yield request
 
 
 # ---------------------------------------------------------------------------
@@ -1075,36 +1222,80 @@ def remove_service_account_tokens(
 
     Cache filenames carry an identity digest, so removing "the" cache for a
     server means removing every identity ever cached under that name unless
-    the caller pins one via ``sa_config``. Sweeping by prefix keeps ``hermes
-    mcp logout``-style flows from leaving a token behind after the operator
-    edited ``username`` or ``scope``.
+    the caller pins one via ``sa_config``. That keeps ``hermes mcp remove`` /
+    logout-style flows from leaving a token behind after the operator edited
+    ``username`` or ``scope``.
 
-    Only ever deletes inside this profile's service-account directory.
+    Ownership is PROVEN, not pattern-matched. A prefix sweep
+    (``<safe-name>-*.json``) collides two ways, and both were reachable:
+
+    - **Sibling server names.** ``_safe_filename`` keeps ``-``, so removing
+      server ``foo`` matched ``foo-bar-<digest>.json`` and deleted the
+      *sibling* server ``foo-bar``'s token.
+    - **A browser-OAuth cache alias.** The legacy sibling-file layout was
+      ``mcp-tokens/<safe>-sa.json``, which is byte-identical to browser
+      OAuth's token path for a server literally named ``<safe>-sa`` — so
+      removing ``foo`` logged the unrelated ``foo-sa`` server out of OAuth.
+
+    Instead: match only the exact ``<safe>-<16 hex>.json`` shape, then confirm
+    each candidate by recomputing its path from the identity recorded *inside*
+    it. The filename digest is taken over ``<raw server name>\\x00<identity>``,
+    so that recomputation succeeds only for files this server actually wrote.
+    The legacy path is deleted only when its payload is structurally a
+    service-account cache (an OAuth payload always carries ``token_type``,
+    which a service-account cache never does).
+
+    A candidate that cannot be read or verified is LEFT IN PLACE: two distinct
+    server names can sanitize to the same ``<safe>`` (``foo`` and ``foo!``
+    both give ``foo``), so an unreadable file's owner is genuinely unknown.
+    Leaving it costs nothing — a corrupt cache already reads as a miss and the
+    next mint overwrites it atomically — whereas deleting it would evict
+    another server's credential.
+
+    Only ever deletes inside this profile's token directory.
     """
     if sa_config is not None:
-        _delete_token_cache(
-            _get_sa_token_path(
-                server_name, hermes_home, sa_identity_fingerprint(sa_config)
+        if not isinstance(sa_config, dict):
+            logger.debug(
+                "MCP service-account '%s': ignoring non-mapping sa_config; "
+                "sweeping every cached identity instead",
+                server_name,
             )
-        )
-        logger.info("MCP service-account '%s': removed token cache", server_name)
-        return
+        else:
+            _delete_token_cache(
+                _get_sa_token_path(
+                    server_name, hermes_home, sa_identity_fingerprint(sa_config)
+                )
+            )
+            logger.info("MCP service-account '%s': removed token cache", server_name)
+            return
 
     from tools.mcp_oauth import _safe_filename
 
+    safe = _safe_filename(server_name)
     token_dir = _get_sa_token_dir(hermes_home)
-    prefix = f"{_safe_filename(server_name)}-"
+    exact = re.compile(rf"^{re.escape(safe)}-[0-9a-f]{{16}}\.json$")
     removed = 0
     try:
-        candidates = list(token_dir.glob(f"{prefix}*.json"))
+        candidates = [p for p in token_dir.glob(f"{safe}-*.json") if exact.match(p.name)]
     except OSError:
         candidates = []
     for path in candidates:
+        data = _read_token_cache(path)
+        if data is None:
+            continue
+        identity = data.get("identity")
+        if identity is not None and not isinstance(identity, str):
+            continue
+        if _get_sa_token_path(server_name, hermes_home, identity) != path:
+            continue
         _delete_token_cache(path)
         removed += 1
-    # Legacy layout (mcp-tokens/<server>-sa.json) written by earlier builds.
-    legacy = _get_sa_token_dir(hermes_home).parent / f"{_safe_filename(server_name)}-sa.json"
-    if legacy.exists():
+    # Legacy layout (mcp-tokens/<server>-sa.json) written by an earlier build
+    # of this feature. Verified by SHAPE because the path itself is ambiguous.
+    legacy = token_dir.parent / f"{safe}-sa.json"
+    legacy_data = _read_token_cache(legacy)
+    if legacy_data is not None and set(legacy_data).issubset(_SA_CACHE_KEYS):
         _delete_token_cache(legacy)
         removed += 1
     logger.info(

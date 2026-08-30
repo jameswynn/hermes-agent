@@ -112,6 +112,8 @@ try:
         FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
         WebSocket, WebSocketDisconnect,
     )
+    from fastapi.encoders import jsonable_encoder
+    from fastapi.exceptions import RequestValidationError
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
     from fastapi.staticfiles import StaticFiles
@@ -128,6 +130,8 @@ except ImportError:
             FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
             WebSocket, WebSocketDisconnect,
         )
+        from fastapi.encoders import jsonable_encoder
+        from fastapi.exceptions import RequestValidationError
         from fastapi.middleware.cors import CORSMiddleware
         from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
         from fastapi.staticfiles import StaticFiles
@@ -523,6 +527,35 @@ def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
 
 
 app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error_without_echoing_input(
+    request: "Request", exc: RequestValidationError
+) -> JSONResponse:
+    """422 responses that name the problem without replaying the payload.
+
+    FastAPI's default handler copies the offending value into each error entry
+    as ``input``. For this app that means a rejected request body is reflected
+    back verbatim — and several of these endpoints exist precisely to receive
+    credential-adjacent input (``bearer_token``, ``EnvVarUpdate.value``, and
+    the ``service_account`` block, whose whole contract is "reject anything
+    that looks like a secret VALUE"). Refusing to store a secret and then
+    echoing it into a response body — and from there into dashboard logs,
+    devtools, HAR captures and any intermediary — undoes the refusal.
+
+    ``loc``, ``msg`` and ``type`` are kept, so a client still learns exactly
+    which field was wrong and why; only the value is withheld. Pydantic's own
+    messages describe the expectation ("Input should be a valid string"),
+    never the submitted value.
+    """
+    sanitized = [
+        {key: value for key, value in error.items() if key != "input"}
+        for error in exc.errors()
+    ]
+    return JSONResponse(
+        status_code=422, content=jsonable_encoder({"detail": sanitized})
+    )
 
 
 # Memory-provider OAuth connect routes live in the memory layer, not here.
@@ -1733,6 +1766,7 @@ from hermes_cli.web_models import (  # noqa: F401
     CronJobUpdate,
     AutomationBlueprintInstantiate,
     MCPServerCreate,
+    MCPServiceAccountConfig,
     MCPServersReplace,
     MCPEnabledToggle,
     MCPCatalogInstall,
@@ -13691,6 +13725,14 @@ def _normalize_mcp_server_create(
         raise ValueError("Provide exactly one of URL (HTTP/SSE) or command (stdio)")
     if auth not in {"none", "header", "oauth", "service_account"}:
         raise ValueError(f"Unsupported auth mode: {auth}")
+    # Refuse rather than silently discard: a dropped service_account block
+    # would save a server that authenticates against nothing, and the client
+    # would have no way to tell it was ignored. Mirrors the CLI's
+    # "--sa-* require --auth service_account".
+    if body.service_account is not None and auth != "service_account":
+        raise ValueError(
+            "service_account configuration requires auth='service_account'"
+        )
 
     server_config: Dict[str, Any] = {}
     if url:
@@ -13709,16 +13751,18 @@ def _normalize_mcp_server_create(
             if body.bearer_token is not None:
                 raise ValueError("Bearer token is not used with service_account auth")
             from tools.mcp_service_account import validate_service_account_config
-            sa_cfg = body.service_account or {}
-            # Reject any secret-value fields: only env-var names are accepted.
-            _SA_SECRET_FIELDS = {"password", "client_secret"}
-            for _f in _SA_SECRET_FIELDS:
-                if _f in sa_cfg:
-                    raise ValueError(
-                        f"service_account.{_f} must not be sent to the server. "
-                        f"Use {_f}_env (an environment-variable name) instead, "
-                        f"and set the value in your profile's .env file."
-                    )
+
+            # ``MCPServiceAccountConfig`` already guaranteed the SHAPE (known
+            # fields only, strings only, no secret-value field). What remains
+            # is the domain contract — which fields the selected grant
+            # actually requires, and the https:// transport rule — which the
+            # CLI and the runtime share, so it must not be re-implemented here.
+            if body.service_account is None:
+                raise ValueError(
+                    "service_account configuration is required when "
+                    "auth='service_account'"
+                )
+            sa_cfg = body.service_account.to_config_dict()
             sa_errors = validate_service_account_config(name, sa_cfg)
             if sa_errors:
                 raise ValueError("; ".join(sa_errors))
@@ -13730,7 +13774,7 @@ def _normalize_mcp_server_create(
             server_config["auth"] = "oauth"
         elif auth == "service_account":
             server_config["auth"] = "service_account"
-            server_config["service_account"] = dict(body.service_account or {})
+            server_config["service_account"] = sa_cfg
     else:
         if auth != "none" or body.bearer_token is not None:
             raise ValueError(
@@ -13780,12 +13824,13 @@ def _mcp_server_summary(name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
         "tools": cfg.get("tools"),
     }
     if auth == "service_account":
-        sa = cfg.get("service_account") or {}
-        # Only non-secret fields: env-var names, not values.
-        summary["service_account"] = {
-            k: v for k, v in sa.items()
-            if k not in {"password", "client_secret"}
-        }
+        # Allowlist, not denylist: config.yaml is hand-editable, so anything
+        # could be in that block. Returning only the fields the contract
+        # defines cannot echo back a secret someone stored there, and a
+        # non-mapping block yields {} instead of 500-ing the server list.
+        summary["service_account"] = MCPServiceAccountConfig.summarize_stored(
+            cfg.get("service_account")
+        )
     return summary
 
 

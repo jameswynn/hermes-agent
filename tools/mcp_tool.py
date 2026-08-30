@@ -117,7 +117,10 @@ from datetime import datetime
 from typing import Any, Coroutine, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
-from tools.registry import tool_error
+from tools.registry import (
+    CHECK_FN_NO_CACHE_ATTR as _REGISTRY_NO_CACHE_ATTR,
+    tool_error,
+)
 from tools.ansi_strip import strip_unicode_tags
 from tools import mcp_profile as _mcp_profile
 
@@ -1376,6 +1379,17 @@ class NonMcpEndpointError(ConnectionError):
     Subclasses :class:`ConnectionError` so callers that only catch the broad
     class still treat it as a connection problem.
     """
+
+
+# Auth modes whose servers must NOT be content-type probed before connecting.
+# The probe is unauthenticated by construction (it runs before the transport,
+# so no token exists yet); a protected endpoint answers it with a login page
+# (``200 text/html``) or a bare ``401``.  Either answer makes the probe raise
+# NonMcpEndpointError, which is non-retryable — the server is marked failed
+# before the token handshake gets a chance to run.  ``oauth`` validates itself
+# through ``.well-known/oauth-protected-resource``; ``service_account``
+# validates itself by completing the client-credentials grant.
+_PREFLIGHT_EXEMPT_AUTH = frozenset({"oauth", "service_account"})
 
 
 def _unwrap_exception_group(exc: BaseException) -> BaseException:
@@ -4030,10 +4044,17 @@ class MCPServerTask:
             # an actionable message, mirroring the URL-validation path above.
             # Skip the probe when _ready is already set (reconnect after a
             # prior successful connect) — the endpoint was validated once,
-            # re-probing is a redundant round-trip. Also skip for OAuth servers:
-            # without a cached token the endpoint returns HTML or 401, which
-            # would incorrectly block the OAuth flow before it can run.
-            if config.get("transport") != "sse" and not config.get("skip_preflight") and not self._ready.is_set() and self._auth_type != "oauth":
+            # re-probing is a redundant round-trip. Also skip for every
+            # token-acquiring auth mode (see _PREFLIGHT_EXEMPT_AUTH): before
+            # the token exists the endpoint answers the unauthenticated probe
+            # with HTML or 401, which would fail the server non-retryably
+            # before the auth handshake ever runs.
+            if (
+                config.get("transport") != "sse"
+                and not config.get("skip_preflight")
+                and not self._ready.is_set()
+                and self._auth_type not in _PREFLIGHT_EXEMPT_AUTH
+            ):
                 try:
                     _probe_headers = dict(config.get("headers") or {})
                     await self._preflight_content_type(
@@ -5705,6 +5726,25 @@ def _wrap_with_dashboard_oauth_flow(coro):
     return _scoped()
 
 
+def _close_unstarted_coroutines(coros) -> None:
+    """Close coroutine objects that will never be awaited.
+
+    Every un-awaited coroutine emits ``RuntimeWarning: coroutine ... was never
+    awaited`` when the GC finalises it and leaks its frame until then. On the
+    MCP scheduling path the frames hold a profile's secret scope and home
+    override, so "it's only a warning" understates it — and under
+    ``-W error::RuntimeWarning`` the finaliser turns an unrelated later
+    allocation into a failure, which is how this class of leak usually gets
+    misattributed.
+    """
+    for coro in coros:
+        if asyncio.iscoroutine(coro):
+            try:
+                coro.close()
+            except Exception:  # pragma: no cover - close() is effectively total
+                logger.debug("Failed to close unstarted MCP coroutine", exc_info=True)
+
+
 def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
     """Schedule a coroutine on the MCP event loop and block until done.
 
@@ -5733,9 +5773,25 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
     # config/registry state. See _wrap_with_profile_scope for why each one is
     # required — losing any of them routes a profile's MCP work through
     # another profile's home, credentials or server registry.
-    inner_coro = coro
-    coro = _wrap_with_profile_scope(coro)
-    coro = _wrap_with_dashboard_oauth_flow(coro)
+    #
+    # Wrapping builds a CHAIN of coroutine objects (original → profile scope →
+    # dashboard OAuth flow), and each link awaits the one below it. If the
+    # outermost is never started, none of the inner ones are either, so all of
+    # them have to be closed — tracking only the original missed the
+    # intermediate wrapper whenever BOTH wrappers applied (a dashboard OAuth
+    # request under a profile scope), leaking one coroutine per failed
+    # schedule.
+    coro_chain = [coro]
+    try:
+        coro = _wrap_with_profile_scope(coro)
+        if coro is not coro_chain[-1]:
+            coro_chain.append(coro)
+        coro = _wrap_with_dashboard_oauth_flow(coro)
+        if coro is not coro_chain[-1]:
+            coro_chain.append(coro)
+    except BaseException:
+        _close_unstarted_coroutines(coro_chain)
+        raise
 
     future = safe_schedule_threadsafe(
         coro, loop,
@@ -5743,12 +5799,9 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
         log_message="MCP scheduling failed",
     )
     if future is None:
-        # safe_schedule_threadsafe closes the coroutine it was handed. When
-        # that was one of the wrappers above, the wrapper never ran, so the
-        # coroutine it would have awaited is still un-started and would leak a
-        # "coroutine was never awaited" RuntimeWarning. Close it here.
-        if coro is not inner_coro and asyncio.iscoroutine(inner_coro):
-            inner_coro.close()
+        # safe_schedule_threadsafe closes the (outermost) coroutine it was
+        # handed; everything below it in the chain is still un-started.
+        _close_unstarted_coroutines(coro_chain[:-1])
         raise RuntimeError("MCP event loop unavailable (failed to schedule)")
     start_time = time.monotonic()
     deadline = None if timeout is None else start_time + timeout
@@ -6815,7 +6868,27 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
 
 
 def _make_check_fn(server_name: str):
-    """Return a check function that verifies the MCP connection is alive."""
+    """Return a check function that verifies the MCP connection is alive.
+
+    Deliberately opts out of the registry's 30s availability TTL cache. That
+    cache exists for probes with real cost — a ``docker version`` subprocess,
+    an SDK import, a credential file read. This one is two dict lookups under
+    a lock against live in-process state, so caching it buys nothing and costs
+    two things:
+
+    * **Staleness suppresses a healthy server.** MCP state moves on sub-second
+      timescales: a transport drop clears ``session``, and the reconnect
+      restores it moments later. A probe that lands in that window pins
+      "unavailable" for the full TTL, so every agent built in the next 30s
+      comes up without that server's tools — with no error and no log line,
+      because the tool was simply filtered out of the snapshot.
+    * **Cross-profile aliasing.** The public tool name (and therefore the
+      registry entry, and therefore the ``check_fn`` object the cache is keyed
+      on) is shared between profiles by design; only the *state it reads* is
+      profile-scoped. Caching a verdict against that shared key is exactly the
+      aliasing ``check_fn_cache_scope`` has to work to undo. Not caching it is
+      the same answer, arrived at structurally.
+    """
 
     def _check() -> bool:
         with _lock:
@@ -6828,6 +6901,7 @@ def _make_check_fn(server_name: str):
             # first real call spawns/connects them (#56832).
             return server_name in _lazy_server_configs
 
+    setattr(_check, _REGISTRY_NO_CACHE_ATTR, True)
     return _check
 
 
@@ -8716,8 +8790,27 @@ def _stop_mcp_loop_if_idle() -> bool:
     tear down the process-global loop when live agent tools are registered on
     it.  Otherwise a dashboard/CLI probe can make later MCP tool calls fail
     with ``MCP event loop is not running``.
+
+    Idleness is a PROCESS-wide question: one loop hosts every profile's server
+    tasks and their stdio children.  ``_servers``/``_server_connecting`` are
+    views onto the ambient profile only, so a probe under profile B would read
+    B's empty registry and stop the loop out from under profile A.  Ask every
+    registry instead — see :func:`_any_profile_holds_servers`.
     """
     return _stop_mcp_loop(only_if_idle=True)
+
+
+def _any_profile_holds_servers() -> bool:
+    """True when ANY profile has a connected or in-flight MCP server.
+
+    Read under ``_lock`` by the loop-stop path; ``all_registries()`` takes its
+    own registry lock and returns a snapshot, so no lock ordering is implied
+    beyond that momentary nesting.
+    """
+    return any(
+        reg.servers or reg.server_connecting
+        for reg in _mcp_profile.all_registries()
+    )
 
 
 async def _drain_mcp_loop_tasks(
@@ -8776,8 +8869,11 @@ def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
     """Stop the background event loop and join its thread."""
     global _mcp_loop, _mcp_thread
     with _lock:
-        if only_if_idle and (_servers or _server_connecting):
-            logger.debug("Leaving MCP event loop running; active servers are registered or connecting")
+        if only_if_idle and _any_profile_holds_servers():
+            logger.debug(
+                "Leaving MCP event loop running; active servers are "
+                "registered or connecting in at least one profile"
+            )
             return False
         loop = _mcp_loop
         thread = _mcp_thread

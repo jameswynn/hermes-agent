@@ -435,6 +435,58 @@ def _unwrap_exception_group(exc: BaseException) -> Exception:
 
 # ─── hermes mcp add ──────────────────────────────────────────────────────────
 
+#: ``--sa-<flag>`` → ``service_account.<key>``. Every value is non-secret:
+#: ``password_env``/``client_secret_env`` name an environment variable, they
+#: never carry its value, so nothing here can put a credential into
+#: config.yaml, shell history, or the process table.
+_SERVICE_ACCOUNT_ARG_FIELDS: tuple[tuple[str, str], ...] = (
+    ("sa_grant_type", "grant_type"),
+    ("sa_token_url", "token_url"),
+    ("sa_client_id", "client_id"),
+    ("sa_username", "username"),
+    ("sa_password_env", "password_env"),
+    ("sa_scope", "scope"),
+    ("sa_client_secret_env", "client_secret_env"),
+)
+
+
+def _service_account_args_present(args) -> List[str]:
+    """Return the ``--sa-*`` flags the user actually supplied.
+
+    ``--sa-grant-type`` has a default, so presence is judged by whether it
+    differs from that default; every other flag defaults to ``None``.
+    """
+    supplied: List[str] = []
+    for attr, key in _SERVICE_ACCOUNT_ARG_FIELDS:
+        value = getattr(args, attr, None)
+        if attr == "sa_grant_type":
+            if value and value != "authentik_app_password":
+                supplied.append("--sa-grant-type")
+            continue
+        if value:
+            supplied.append("--" + attr.replace("_", "-"))
+    return supplied
+
+
+def _build_service_account_config(args, server_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge the ``--sa-*`` flags over any preset-supplied block.
+
+    Returns a plain dict suitable for ``service_account:`` in config.yaml.
+    Values are stripped; empties are dropped so ``validate_service_account_
+    config`` reports them as missing rather than as malformed.
+    """
+    base = server_config.get("service_account")
+    sa_cfg: Dict[str, Any] = dict(base) if isinstance(base, dict) else {}
+    for attr, key in _SERVICE_ACCOUNT_ARG_FIELDS:
+        value = getattr(args, attr, None)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            sa_cfg[key] = text
+    return sa_cfg
+
+
 def cmd_mcp_add(args):
     """Add a new MCP server with discovery-first tool selection."""
     name = args.name
@@ -477,6 +529,19 @@ def cmd_mcp_add(args):
         _info('  hermes mcp add ink --url "https://mcp.ml.ink/mcp"')
         _info('  hermes mcp add github --command npx --args @modelcontextprotocol/server-github')
         _info('  hermes mcp add myserver --preset mypreset')
+        return
+
+    # --sa-* only means something for `--auth service_account` on an HTTP
+    # server. Refuse rather than silently discard: a dropped --sa-token-url
+    # would otherwise save a server that authenticates against nothing.
+    sa_flags = _service_account_args_present(args)
+    if sa_flags and auth_type != "service_account":
+        _error(
+            f"{', '.join(sa_flags)} require --auth service_account"
+        )
+        return
+    if auth_type == "service_account" and not url:
+        _error("--auth service_account requires an HTTP server (--url)")
         return
 
     # Check if server already exists
@@ -535,27 +600,32 @@ def cmd_mcp_add(args):
                 return
 
     elif url and auth_type == "service_account":
-        # Service-account M2M: validate the sub-block; secrets stay in env vars.
+        # Service-account M2M: build the sub-block from the --sa-* flags and
+        # validate it. Only env-var NAMES are accepted for the password and
+        # client secret, so no secret value ever reaches config.yaml.
         print()
         _info(f"Configuring service-account auth for '{name}'...")
-        sa_cfg = server_config.get("service_account") or {}
+        sa_cfg = _build_service_account_config(args, server_config)
         from tools.mcp_service_account import validate_service_account_config
         sa_errors = validate_service_account_config(name, sa_cfg)
         if sa_errors:
             for err in sa_errors:
                 _warning(err)
             _warning(
-                "Fix the service_account block in config.yaml and re-run. "
-                "Secrets must be in environment variables, not in config."
+                "Supply the missing values with the --sa-* flags "
+                "(--sa-token-url, --sa-client-id, --sa-username, "
+                "--sa-password-env) and re-run. Secrets must be in "
+                "environment variables, not in config."
             )
             return
         server_config["auth"] = "service_account"
+        server_config["service_account"] = sa_cfg
         _success(
             f"Service-account auth configured — token will be acquired from "
-            f"{sa_cfg.get('token_url', '(token_url)')} on first connection"
+            f"{sa_cfg['token_url']} on first connection"
         )
         _info(
-            f"Ensure ${sa_cfg.get('password_env', 'PASSWORD_ENV')} is set "
+            f"Ensure ${sa_cfg['password_env']} is set "
             "in your shell or in $HERMES_HOME/.env before connecting."
         )
 

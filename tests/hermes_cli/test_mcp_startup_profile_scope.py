@@ -99,6 +99,27 @@ def _start_discovery_for(home: Path, secrets: dict[str, str] | None = None) -> N
         reset_hermes_home_override(home_token)
 
 
+def _start_coordinator_for(home: Path, secrets: dict[str, str] | None = None) -> None:
+    """Call the coordinator DIRECTLY under *home*'s profile context.
+
+    ``_start_discovery_for`` goes through ``tui_gateway.entry``, which applies
+    its own config gate before delegating. The lock-scope tests need the
+    coordinator itself, with nothing in front of it.
+    """
+    home_token = set_hermes_home_override(str(home))
+    secret_token = secret_scope_mod.set_secret_scope(
+        secrets if secrets is not None else {}
+    )
+    try:
+        mcp_startup.start_background_mcp_discovery(
+            logger=logging.getLogger("tui_gateway.entry"),
+            thread_name=f"test-mcp-discovery-{home.name}",
+        )
+    finally:
+        secret_scope_mod.reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+
+
 def _join_all_discovery(timeout: float = _JOIN_TIMEOUT_S) -> None:
     """Join every discovery thread this module may have spawned."""
     deadline = time.monotonic() + timeout
@@ -507,3 +528,110 @@ def test_profile_without_mcp_servers_is_done_not_failed(tmp_path, recorder, capl
 
     assert [r.getMessage() for r in caplog.records] == []
     assert recorder.seen == []
+
+
+# ---------------------------------------------------------------------------
+# 3. The coordinator lock must not span the blocking parts of the decision
+# ---------------------------------------------------------------------------
+
+
+def test_slow_config_probe_for_one_profile_does_not_block_another(
+    profiles, recorder, monkeypatch
+):
+    """One profile's config/registry probe must not hold the process lock.
+
+    ``start_background_mcp_discovery`` used to hold the module-global
+    ``_mcp_discovery_lock`` across ``_has_configured_mcp_servers()`` (a
+    ``config.yaml`` read) and ``_profile_mcp_is_populated()`` (which imports
+    the MCP SDK stack and takes ``tools.mcp_tool``'s registry lock). Every
+    other profile then blocked on that lock — including
+    ``mcp_discovery_in_flight()``, which the multiplexed gateway calls once
+    per turn from ``GatewayRunner._ensure_profile_mcp_tools`` while holding
+    its own readiness lock. A cold MCP import for profile A therefore stalled
+    profile B's turn.
+
+    The decision now runs under a PER-PROFILE lock, so B proceeds while A is
+    still probing.
+
+    Entered through ``start_background_mcp_discovery`` rather than
+    ``ensure_mcp_discovery_started``: the latter runs its OWN
+    ``_has_configured_mcp_servers()`` gate first (``tui_gateway/entry.py``),
+    outside any coordinator lock, so blocking there would prove nothing about
+    the lock this test is about.
+    """
+    home_a, home_b = profiles
+
+    a_probing = threading.Event()
+    release_a = threading.Event()
+    real_probe = mcp_startup._has_configured_mcp_servers
+
+    def _slow_probe_for_a() -> bool:
+        from hermes_constants import get_hermes_home
+
+        if str(get_hermes_home()) == str(home_a):
+            a_probing.set()
+            # Bounded so a regression fails the assertions below rather than
+            # hanging the suite.
+            release_a.wait(timeout=_JOIN_TIMEOUT_S)
+        return real_probe()
+
+    monkeypatch.setattr(
+        mcp_startup, "_has_configured_mcp_servers", _slow_probe_for_a
+    )
+
+    a_thread = threading.Thread(
+        target=_start_coordinator_for, args=(home_a,), daemon=True
+    )
+    a_thread.start()
+    assert a_probing.wait(timeout=_JOIN_TIMEOUT_S), "profile A never reached the probe"
+
+    # A is parked inside its own decision. B must still be able to ask about
+    # itself and to start its own run, both without waiting on A.
+    b_done = threading.Event()
+
+    def _run_b() -> None:
+        token = set_hermes_home_override(str(home_b))
+        try:
+            assert mcp_startup.mcp_discovery_in_flight() is False
+        finally:
+            reset_hermes_home_override(token)
+        _start_coordinator_for(home_b)
+        b_done.set()
+
+    b_thread = threading.Thread(target=_run_b, daemon=True)
+    b_thread.start()
+    assert b_done.wait(timeout=5.0), (
+        "profile B blocked behind profile A's config probe — the coordinator "
+        "lock is spanning the blocking part of the decision again"
+    )
+
+    release_a.set()
+    a_thread.join(timeout=_JOIN_TIMEOUT_S)
+    b_thread.join(timeout=_JOIN_TIMEOUT_S)
+    _join_all_discovery()
+
+    # Both profiles really did discover, each reading its own config.
+    assert {str(home) for home, _ in recorder.seen} == {str(home_a), str(home_b)}
+
+
+def test_same_profile_still_deduplicates_under_the_split_lock(profiles, recorder):
+    """Splitting the lock must not let one profile spawn two runs.
+
+    Same-profile callers serialize on that profile's own lock, so the second
+    caller sees the first caller's installed thread and returns.
+    """
+    home_a, _home_b = profiles
+    release_a = recorder.gate(home_a)
+    a_entered = recorder.entered_event(home_a)
+
+    _start_discovery_for(home_a)
+    assert a_entered.wait(timeout=_JOIN_TIMEOUT_S)
+
+    for _ in range(3):
+        _start_discovery_for(home_a)
+
+    assert len(mcp_startup.discovery_threads()) == 1
+
+    release_a.set()
+    _join_all_discovery()
+    assert [str(home) for home, _ in recorder.seen] == [str(home_a)]

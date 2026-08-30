@@ -231,6 +231,51 @@ def test_run_skips_preflight_for_oauth(monkeypatch):
     )
 
 
+def test_run_skips_preflight_for_service_account(monkeypatch):
+    """``auth: service_account`` skips the probe for the same reason as OAuth.
+
+    A machine-to-machine MCP server is unauthenticated until the client-
+    credentials grant produces a bearer token, so the probe's unauthenticated
+    GET gets the same ``200 text/html`` login page (or a bare ``401``) that
+    OAuth servers return.  Rejecting on that answer sets ``self._error`` and
+    returns *before* ``_run_http`` ever builds the service-account provider —
+    the server can never authenticate.
+    """
+    import tools.mcp_tool as _mcp
+
+    preflight_calls: list[str] = []
+
+    async def _inner():
+        async def _fake_preflight(self, url, **kwargs):
+            preflight_calls.append(url)
+
+        async def _fake_run_http(self, config):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(_mcp, "_validate_remote_mcp_url", lambda n, u: None)
+        monkeypatch.setattr(_mcp.MCPServerTask, "_preflight_content_type", _fake_preflight)
+        monkeypatch.setattr(_mcp.MCPServerTask, "_run_http", _fake_run_http)
+
+        task = _mcp.MCPServerTask("service-account-test")
+        with pytest.raises(asyncio.CancelledError):
+            await task.run({
+                "url": "https://mcp.example.com/mcp",
+                "auth": "service_account",
+                "service_account": {
+                    "token_url": "https://idp.example.com/token",
+                    "client_id": "hermes",
+                },
+            })
+
+    asyncio.run(_inner())
+    assert preflight_calls == [], (
+        "_preflight_content_type must not be called for service-account "
+        "servers; the unauthenticated probe sees HTML/401 and fails the "
+        "server with NonMcpEndpointError before the client-credentials "
+        "grant can run"
+    )
+
+
 def test_run_skips_preflight_when_skip_preflight_set(monkeypatch):
     """``skip_preflight: true`` in server config bypasses the probe entirely.
 

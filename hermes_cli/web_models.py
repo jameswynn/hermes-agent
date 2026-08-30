@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, SecretStr, field_validator, model_validator
 
 
 # --- from web_server.py (originally lines 1273-1372) ---
@@ -417,6 +417,113 @@ class AutomationBlueprintInstantiate(BaseModel):
 
 # --- from web_server.py (originally lines 13002-13019) ---
 
+#: Fields whose NAME says the client tried to send a secret VALUE. Checked
+#: case-insensitively before ``extra="forbid"`` reports them, so the operator
+#: gets the actionable "use <field>_env" message rather than a generic
+#: "extra inputs are not permitted".
+_SA_SECRET_VALUE_FIELDS: Dict[str, str] = {
+    "password": "password_env",
+    "client_secret": "client_secret_env",
+}
+
+
+class MCPServiceAccountConfig(BaseModel):
+    """The dashboard-submitted ``service_account:`` block. Env-var NAMES only.
+
+    This was ``Dict[str, Any]``, which meant the dashboard would persist
+    whatever the client sent into ``config.yaml`` verbatim and echo it back on
+    read. Two things follow from a strict model instead:
+
+    * **Nothing secret can be stored.** Every field here is a non-secret
+      configuration reference — ``password_env`` and ``client_secret_env``
+      name an environment variable, they never carry its value — and
+      ``extra="forbid"`` means no other key survives. A caller that sends
+      ``password`` or ``client_secret`` (or any key at all that this contract
+      does not define) is refused rather than having it written to disk and
+      returned by ``GET /api/mcp/servers``.
+    * **Malformed input fails as a 422 with a readable message**, not as an
+      opaque ``AttributeError``/``TypeError`` 500 deeper in the config
+      writer. A non-mapping body, a nested object where a string belongs, a
+      wrong type — all are reported at the boundary.
+
+    ``token_url``/``client_id``/``username``/``password_env`` are typed as
+    optional here on purpose: *presence* is a domain rule that
+    ``tools.mcp_service_account.validate_service_account_config`` owns for the
+    CLI, the dashboard and the runtime alike, and duplicating it here would
+    let the two drift.
+    """
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    grant_type: str = "authentik_app_password"
+    token_url: str = ""
+    client_id: str = ""
+    username: str = ""
+    #: Env-var NAME holding the service-account password — never the password.
+    password_env: str = ""
+    scope: str = ""
+    #: Env-var NAME holding an optional client secret — never the secret.
+    client_secret_env: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_secret_values_and_non_mappings(cls, data: Any) -> Any:
+        if data is None or isinstance(data, cls):
+            return data
+        if not isinstance(data, dict):
+            raise ValueError(
+                "service_account must be an object with configuration "
+                "references (token_url, client_id, username, password_env, "
+                f"scope, client_secret_env); got {type(data).__name__}"
+            )
+        for key in data:
+            replacement = _SA_SECRET_VALUE_FIELDS.get(str(key).strip().lower())
+            if replacement:
+                raise ValueError(
+                    f"service_account.{key} must not be sent to the server. "
+                    f"Use {replacement} (an environment-variable name) "
+                    "instead, and set the value in your profile's .env file."
+                )
+        return data
+
+    def to_config_dict(self) -> Dict[str, str]:
+        """Serialize to the ``service_account:`` mapping written to config.yaml.
+
+        Empty fields are dropped rather than written as ``""`` so
+        ``validate_service_account_config`` reports them as *missing* (with
+        the flag/field name to supply) instead of as malformed, and so an
+        untouched optional field never appears in the file at all.
+        """
+        return {
+            field: value
+            for field, value in (
+                (name, getattr(self, name)) for name in type(self).model_fields
+            )
+            if isinstance(value, str) and value
+        }
+
+    @classmethod
+    def summarize_stored(cls, stored: Any) -> Dict[str, str]:
+        """Non-secret view of an ON-DISK block, for read endpoints.
+
+        An allowlist, not a denylist. ``config.yaml`` is hand-editable, so the
+        stored block can hold anything; filtering out a fixed pair of names
+        (the previous behaviour) still echoed back ``passwd``, ``secret``, a
+        mis-cased ``Password``, or any other key someone put there. Returning
+        only the fields this contract defines cannot leak one. Non-mapping
+        input yields ``{}`` rather than raising, so one hand-broken entry
+        cannot 500 the whole server list.
+        """
+        if not isinstance(stored, dict):
+            return {}
+        out: Dict[str, str] = {}
+        for name in cls.model_fields:
+            value = stored.get(name)
+            if isinstance(value, str) and value.strip():
+                out[name] = value.strip()
+        return out
+
+
 class MCPServerCreate(BaseModel):
     name: str
     url: Optional[str] = None
@@ -430,7 +537,7 @@ class MCPServerCreate(BaseModel):
     bearer_token: Optional[SecretStr] = None
     # Non-secret service-account fields (token_url, client_id, username, scope,
     # password_env, client_secret_env). Secrets are referenced by env-var name only.
-    service_account: Optional[Dict[str, Any]] = None
+    service_account: Optional[MCPServiceAccountConfig] = None
     profile: Optional[str] = None
 
 

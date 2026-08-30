@@ -318,6 +318,27 @@ class ProfileScopedSet(MutableSet):
     def __init__(self, field: str) -> None:
         self._field = field
 
+    @classmethod
+    def _from_iterable(cls, it) -> set:
+        """Build the RESULT of a set operation as a plain ``set``.
+
+        ``collections.abc.Set`` implements ``|``, ``&``, ``-``, ``^`` (and
+        their reflected forms, plus ``MutableSet.__iand__``/``__ixor__``) by
+        calling ``self._from_iterable(<generator>)``, whose default is
+        ``cls(iterable)``. Our ``__init__`` takes a registry FIELD NAME, so the
+        default handed the generator straight to ``getattr`` and every operator
+        died with ``TypeError: attribute name must be string, not 'generator'``
+        — on both operand orders, since ``set.__or__`` returns
+        ``NotImplemented`` for a non-``set`` and Python then calls our
+        ``__ror__``.
+
+        A plain ``set`` is also the semantically right result type: these views
+        are *aliases* for one field of one profile's registry, so a derived
+        value must be an ordinary detached set, never a second view that would
+        silently re-bind to whichever profile is active when it is next read.
+        """
+        return set(it)
+
     @property
     def _target(self) -> set:
         return getattr(current_registry(), self._field)
@@ -345,6 +366,37 @@ class ProfileScopedSet(MutableSet):
 
     def difference_update(self, *others: Any) -> None:
         self._target.difference_update(*others)
+
+    def intersection_update(self, *others: Any) -> None:
+        self._target.intersection_update(*others)
+
+    def symmetric_difference_update(self, other: Any) -> None:
+        self._target.symmetric_difference_update(other)
+
+    # ``MutableSet`` supplies the operators but none of ``set``'s NAMED
+    # methods. These views stand in for plain ``set`` objects at every MCP
+    # call site, so a caller reaching for ``.union(...)`` must not get an
+    # AttributeError that only fires on the profile-scoped build.
+    def union(self, *others: Any) -> set:
+        return self._target.union(*others)
+
+    def intersection(self, *others: Any) -> set:
+        return self._target.intersection(*others)
+
+    def difference(self, *others: Any) -> set:
+        return self._target.difference(*others)
+
+    def symmetric_difference(self, other: Any) -> set:
+        return self._target.symmetric_difference(other)
+
+    def issubset(self, other: Any) -> bool:
+        return self._target.issubset(other)
+
+    def issuperset(self, other: Any) -> bool:
+        return self._target.issuperset(other)
+
+    def isdisjoint(self, other: Any) -> bool:
+        return self._target.isdisjoint(other)
 
     def copy(self) -> set:
         return set(self._target)

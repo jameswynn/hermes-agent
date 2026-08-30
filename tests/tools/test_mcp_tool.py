@@ -540,6 +540,69 @@ class TestRunOnMcpLoop:
         ]
         assert runtime_warnings == []
 
+    def test_scheduler_failure_closes_every_wrapper_in_the_chain(self, tmp_path):
+        """Both scope wrappers applying used to leak the INTERMEDIATE one.
+
+        ``_run_on_mcp_loop`` wraps the caller's coroutine twice: once to carry
+        the profile scope (HERMES_HOME override + secret scope + MCP profile
+        pin) and once to carry a dashboard OAuth flow. That builds a chain
+        where each link awaits the one below it, so if the outermost never
+        starts, none of them do.
+
+        ``safe_schedule_threadsafe`` closes only the outermost coroutine it
+        was handed, and the cleanup here only closed the ORIGINAL — so with
+        both wrappers active (a dashboard OAuth request made inside a profile
+        scope) the profile-scope wrapper leaked its frame and emitted
+        ``coroutine '_scoped' was never awaited`` on the next GC. Under
+        ``-W error::RuntimeWarning`` that finaliser turns an unrelated later
+        allocation into a failure, which is how it gets misattributed.
+        """
+        import gc
+        import warnings
+        import tools.mcp_tool as mcp
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from tools.mcp_dashboard_oauth import (
+            DashboardOAuthFlow,
+            dashboard_oauth_flow,
+        )
+
+        async def _sample():
+            return "ok"
+
+        fake_loop = MagicMock()
+        fake_loop.is_running.return_value = True
+        coro = _sample()
+
+        # A home override makes _wrap_with_profile_scope apply; an active
+        # dashboard flow makes _wrap_with_dashboard_oauth_flow apply too.
+        home_token = set_hermes_home_override(str(tmp_path))
+        try:
+            with dashboard_oauth_flow(object.__new__(DashboardOAuthFlow)):
+                with patch.object(mcp, "_mcp_loop", fake_loop):
+                    with warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter("always")
+                        with patch(
+                            "agent.async_utils.asyncio.run_coroutine_threadsafe",
+                            side_effect=RuntimeError("scheduler down"),
+                        ):
+                            with pytest.raises(RuntimeError, match="unavailable"):
+                                mcp._run_on_mcp_loop(coro)
+                        gc.collect()
+        finally:
+            reset_hermes_home_override(home_token)
+
+        assert coro.cr_frame is None, "the caller's own coroutine leaked"
+        leaked = [
+            str(w.message)
+            for w in caught
+            if issubclass(w.category, RuntimeWarning)
+            and "was never awaited" in str(w.message)
+        ]
+        assert leaked == [], f"un-awaited coroutine(s) leaked: {leaked}"
+
 
 # ---------------------------------------------------------------------------
 # Tool handler

@@ -8533,10 +8533,30 @@ def _schedule_mcp_late_refresh(sid: str, agent) -> None:
         from tui_gateway.entry import mcp_discovery_in_flight, join_mcp_discovery
     except Exception:
         return
+
+    # Capture the caller's profile scope for replay inside the worker thread.
+    # This runs on the deferred BUILD thread, which has the session profile's
+    # HERMES_HOME override and secret scope installed — but ContextVars do not
+    # cross into a bare ``threading.Thread``, so without the replay below the
+    # refresh worker runs under the LAUNCH profile. Every question it asks is
+    # then asked about the wrong profile: which discovery thread to join
+    # (``_thread_for_current_profile`` keys on the ambient home), and which
+    # registry ``refresh_agent_mcp_tools`` reads. On a multiplexed desktop
+    # gateway that means the late refresh either finds nothing or splices
+    # another profile's MCP tools into this session's agent.
+    try:
+        from hermes_cli.mcp_startup import capture_caller_scope, caller_profile_scope
+
+        caller_scope = capture_caller_scope()
+    except Exception:
+        caller_profile_scope = None  # type: ignore[assignment]
+        caller_scope = (None, None)
+
+    # Asked here, under the caller's own scope, so it reports on THIS profile.
     if not mcp_discovery_in_flight():
         return
 
-    def _wait_then_refresh() -> None:
+    def _wait_then_refresh_inner() -> None:
         # Bounded but generous — a server still not connected after this is
         # genuinely slow/dead; the user can /reload-mcp once it recovers.
         if not join_mcp_discovery(timeout=30.0):
@@ -8570,6 +8590,14 @@ def _schedule_mcp_late_refresh(sid: str, agent) -> None:
             info = _session_info(agent, session)
         # Emit outside the lock — write_json must not block under _sessions_lock.
         _emit("session.info", sid, info)
+
+    def _wait_then_refresh() -> None:
+        if caller_profile_scope is None:
+            _wait_then_refresh_inner()
+            return
+        with caller_profile_scope(*caller_scope):
+            _wait_then_refresh_inner()
+
     threading.Thread(
         target=_wait_then_refresh,
         name=f"tui-mcp-late-refresh-{sid}",

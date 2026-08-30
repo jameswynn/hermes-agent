@@ -2339,9 +2339,19 @@ def _profile_runtime_scope(profile_home: "Path"):
         reset_hermes_home_override(home_token)
 
 
-# Minimum gap between per-turn MCP readiness attempts for ONE profile. See
-# GatewayRunner._profile_mcp_readiness_due.
+# Minimum gap between per-turn MCP readiness attempts for ONE profile, measured
+# from when the last attempt FINISHED. Enforced in
+# GatewayRunner._ensure_profile_mcp_tools, which stamps the deadline under the
+# same lock that claims ownership of the pass; see
+# _profile_mcp_readiness_due_locked for the gate itself.
 _PROFILE_MCP_READINESS_INTERVAL_S = 60.0
+
+# Guards the lazy creation of each runner's readiness state. The state itself
+# contains the per-runner lock, so it cannot guard its own construction: two
+# turns racing a ``getattr(self, ..., None)`` would each build their own lock
+# and neither would exclude the other. Module-level and only ever held for the
+# few instructions that build the tuple.
+_PROFILE_MCP_READINESS_INIT_LOCK = threading.Lock()
 
 
 def _ensure_profile_mcp_discovery(*, wait: bool = True) -> None:
@@ -16060,7 +16070,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     claimed[retry_claim] = active
 
         profile_homes = _multiplex_profile_homes(self.config)
-        self._warm_profile_mcp_discovery(profile_homes, active)
+        # Off the loop: spawning a profile's discovery thread first reads that
+        # profile's config.yaml and builds its secret scope from .env, once per
+        # served profile. That is blocking disk I/O (plus, on the retry branch,
+        # the ~200ms MCP SDK import), and running it inline on the event loop
+        # stalled every other startup task behind it.
+        await asyncio.get_running_loop().run_in_executor(
+            None, self._warm_profile_mcp_discovery, profile_homes, active
+        )
         for profile_name, profile_home in profile_homes:
             if profile_name == active:
                 continue  # handled by the primary startup loop
@@ -16126,6 +16143,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         readiness call), so a slow or dead MCP server cannot delay adapter
         startup. A profile that fails here is logged and skipped; discovery is
         never a reason to refuse to serve a profile.
+
+        Blocking: the caller must run this off the event loop (``start()``
+        hands it to the default executor). "Only spawns a thread" still means
+        one config.yaml read and one ``.env``-backed secret scope per served
+        profile before the spawn.
         """
         for profile_name, profile_home in profile_homes:
             if not profile_name or profile_name == active or profile_home is None:
@@ -29204,20 +29226,114 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         discovery thread read THIS profile's ``mcp_servers`` and resolve its
         ``${VAR}`` refs against THIS profile's credentials.
 
+        **Concurrent turns for one profile share ONE readiness pass.** Turns
+        are independent tasks on the same loop, so the executor hop is an
+        ``await`` point: a second turn arriving during it used to find the
+        deadline already stamped and return immediately, building its
+        ``AIAgent`` — and snapshotting its tool list — while the discovery it
+        was supposed to wait for was still running. Ownership of the pass is
+        therefore claimed atomically here, and every other turn for that
+        profile awaits the owner's completion instead of skipping. That is the
+        whole point of the readiness call: joining the run IS the readiness.
+
         Only reached from the multiplexed branches of ``_run_agent`` /
         ``_run_background_task``; single-profile gateways keep discovering
         once at ``start_gateway()`` and are unaffected. Never raises — a
         shutting-down executor or a broken MCP config must not fail the turn.
         """
-        if not self._profile_mcp_readiness_due():
+        key = self._profile_mcp_readiness_key()
+        if key is None:
+            # Unresolvable profile identity: attempt it, unshared and ungated,
+            # exactly as the pre-existing fail-open behaviour did.
+            await self._run_profile_mcp_readiness()
             return
+
+        lock, due_at, in_flight = self._profile_mcp_readiness_state()
+        loop = asyncio.get_running_loop()
+        with lock:
+            pending = in_flight.get(key)
+            if pending is not None and pending.get_loop() is not loop:
+                # A future from a previous loop (gateway restart in-process)
+                # can never complete for this one; drop it and re-own.
+                pending = None
+                in_flight.pop(key, None)
+            if pending is None:
+                if not self._profile_mcp_readiness_due_locked(key, due_at):
+                    return
+                pending = loop.create_future()
+                in_flight[key] = pending
+                owner = True
+            else:
+                owner = False
+
+        if not owner:
+            # ``shield`` so this turn being cancelled does not cancel the
+            # readiness pass every other turn for this profile is waiting on.
+            try:
+                await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "Shared profile MCP readiness pass failed", exc_info=True
+                )
+            return
+
+        try:
+            await self._run_profile_mcp_readiness()
+        finally:
+            with lock:
+                if in_flight.get(key) is pending:
+                    in_flight.pop(key, None)
+                # Stamp on COMPLETION, not on claim: the floor is "don't
+                # re-run within the interval of the last attempt finishing".
+                due_at[key] = time.monotonic() + _PROFILE_MCP_READINESS_INTERVAL_S
+            if not pending.done():
+                pending.set_result(None)
+
+    async def _run_profile_mcp_readiness(self) -> None:
+        """Run one bounded readiness pass. Never raises."""
         try:
             await self._run_in_executor_with_context(_ensure_profile_mcp_discovery)
         except Exception:
             logger.debug("Profile MCP discovery readiness skipped", exc_info=True)
 
-    def _profile_mcp_readiness_due(self) -> bool:
-        """Rate-limit the per-turn readiness call, per profile.
+    def _profile_mcp_readiness_key(self) -> "Optional[str]":
+        """Canonical key for the profile scope in effect, or None if unreadable."""
+        try:
+            from hermes_constants import get_hermes_home, hermes_home_key
+
+            return hermes_home_key(str(get_hermes_home()))
+        except Exception:
+            return None
+
+    def _profile_mcp_readiness_state(self) -> "tuple[threading.Lock, dict, dict]":
+        """Return this runner's ``(lock, due_at, in_flight)`` readiness state.
+
+        Built under a module-level lock rather than a per-runner one, because
+        the per-runner lock lives *inside* the state and so cannot guard its
+        own construction: two turns racing the ``getattr`` would each install
+        their own lock and neither would exclude the other, leaving the
+        deadline map and the in-flight map unsynchronised.
+
+        Lazy (not ``__init__``-time) because ``GatewayRunner`` is also built
+        via ``__new__`` on several paths, including the multiplex tests.
+        """
+        state = getattr(self, "_profile_mcp_readiness_state_obj", None)
+        if state is None:
+            with _PROFILE_MCP_READINESS_INIT_LOCK:
+                state = getattr(self, "_profile_mcp_readiness_state_obj", None)
+                if state is None:
+                    state = (threading.Lock(), {}, {})
+                    # Named aliases kept for diagnostics/introspection.
+                    self._profile_mcp_readiness_lock = state[0]
+                    self._profile_mcp_readiness_due_at = state[1]
+                    self._profile_mcp_readiness_inflight = state[2]
+                    self._profile_mcp_readiness_state_obj = state
+        return state
+
+    def _profile_mcp_readiness_due_locked(self, key: str, due_at: dict) -> bool:
+        """Rate-limit the per-turn readiness call, per profile. Caller holds the lock.
 
         ``start_background_mcp_discovery``'s retry allowance was written for a
         caller that runs once per AGENT BUILD (a TUI session start, a model
@@ -29235,35 +29351,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         idempotent, retry allowed on the next call — is unchanged for the
         CLI/TUI callers that depend on it.
 
-        An in-flight run is always allowed through: joining it IS the
-        readiness this method exists to provide, and it is the one case where
-        skipping would cost the turn its MCP tools. Never raises; an
-        unreadable profile scope degrades to "attempt it".
+        A discovery run already in flight is always allowed through: joining
+        it IS the readiness this gate exists to provide, and it is the one
+        case where skipping would cost the turn its MCP tools. That covers the
+        startup warm-up thread, which no readiness call owns. Never raises; an
+        unreadable coordinator degrades to "attempt it".
         """
         try:
             from hermes_cli.mcp_startup import mcp_discovery_in_flight
-            from hermes_constants import get_hermes_home, hermes_home_key
 
             if mcp_discovery_in_flight():
                 return True
-            key = hermes_home_key(str(get_hermes_home()))
         except Exception:
             return True
+        deadline = due_at.get(key)
+        return deadline is None or time.monotonic() >= deadline
 
-        lock = getattr(self, "_profile_mcp_readiness_lock", None)
-        if lock is None:
-            lock = threading.Lock()
-            self._profile_mcp_readiness_lock = lock
-        now = time.monotonic()
+    def _profile_mcp_readiness_due(self) -> bool:
+        """Is a readiness pass due for the active profile? Diagnostics only.
+
+        Read-only — it neither claims ownership nor stamps the deadline; that
+        now happens atomically in ``_ensure_profile_mcp_tools``, which is why
+        this has no in-tree callers left. Kept as the non-mutating way to ask
+        the question (introspection, a debug endpoint, a future health probe);
+        do NOT gate a readiness pass on it, because between this returning
+        True and the caller acting, another turn may already have claimed the
+        pass.
+        """
+        key = self._profile_mcp_readiness_key()
+        if key is None:
+            return True
+        lock, due_at, in_flight = self._profile_mcp_readiness_state()
         with lock:
-            due_at = getattr(self, "_profile_mcp_readiness_due_at", None)
-            if due_at is None:
-                due_at = {}
-                self._profile_mcp_readiness_due_at = due_at
-            if key in due_at and now < due_at[key]:
-                return False
-            due_at[key] = now + _PROFILE_MCP_READINESS_INTERVAL_S
-        return True
+            if key in in_flight:
+                return True
+            return self._profile_mcp_readiness_due_locked(key, due_at)
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.

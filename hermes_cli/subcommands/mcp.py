@@ -58,8 +58,39 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
         default=[],
         help="Arguments for stdio command; must be the last option",
     )
-    mcp_add_p.add_argument("--auth", choices=["oauth", "header"], help="Auth method")
+    mcp_add_p.add_argument(
+        "--auth",
+        choices=["oauth", "header", "service_account"],
+        help="Auth method",
+    )
     mcp_add_p.add_argument("--preset", help="Known MCP preset name")
+    # ── Service-account (M2M) auth ────────────────────────────────────────
+    # Only env-var NAMES are accepted for the password and client secret;
+    # there is deliberately no flag that takes a secret value, so a secret
+    # can never reach config.yaml, the shell history, or the process table.
+    sa_group = mcp_add_p.add_argument_group(
+        "service-account auth (--auth service_account)",
+        "Machine-to-machine token exchange for HTTP servers. Secrets are "
+        "referenced by environment-variable name and read at connect time.",
+    )
+    sa_group.add_argument(
+        "--sa-grant-type",
+        default="authentik_app_password",
+        help="Grant strategy (default: authentik_app_password)",
+    )
+    sa_group.add_argument("--sa-token-url", help="Token endpoint URL (https://)")
+    sa_group.add_argument("--sa-client-id", help="OAuth client id")
+    sa_group.add_argument("--sa-username", help="Service-account username")
+    sa_group.add_argument(
+        "--sa-password-env",
+        help="Name of the env var holding the service-account password "
+        "(e.g. AUTHENTIK_SVC_APP_PASSWORD) — not the password itself",
+    )
+    sa_group.add_argument("--sa-scope", help="Requested scope string (optional)")
+    sa_group.add_argument(
+        "--sa-client-secret-env",
+        help="Name of the env var holding an optional client secret",
+    )
     mcp_add_p.add_argument(
         "--connect-timeout",
         type=float,

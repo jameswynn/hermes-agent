@@ -406,3 +406,233 @@ def test_discovery_failure_is_reported_against_its_profile(
         f"no profile-attributed MCP warning; saw: "
         f"{[r.getMessage() for r in caplog.records]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 5. Concurrent turns for one profile must SHARE the readiness pass
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrentReadiness:
+    """Two turns for one profile arriving together must both be ready.
+
+    ``_ensure_profile_mcp_tools`` hops to the executor, so it is an ``await``
+    point. A second turn landing inside that window used to find the deadline
+    already stamped by the first, return immediately, and build its
+    ``AIAgent`` — snapshotting the tool list — while the discovery it was
+    supposed to wait for was still running. That is the same "no tool, no
+    error, no log line" symptom this whole file exists for, just reached by a
+    race instead of by a missing call.
+    """
+
+    def _runner(self):
+        return _make_runner(multiplex=True)
+
+    def _instrumented(self, runner, home, *, hold: "asyncio.Event | None" = None):
+        """Replace the executor hop with a recorded, controllable pass."""
+        calls: list[str] = []
+        entered = threading.Event()
+
+        async def _fake_readiness():
+            calls.append("run")
+            entered.set()
+            if hold is not None:
+                await hold.wait()
+
+        runner._run_profile_mcp_readiness = _fake_readiness
+        return calls, entered
+
+    def test_second_turn_waits_for_the_first_instead_of_skipping(
+        self, profiles, tmp_path
+    ):
+        home_a, _home_b = profiles
+        runner = self._runner()
+
+        async def _go():
+            hold = asyncio.Event()
+            calls, entered = self._instrumented(runner, home_a, hold=hold)
+            finished: list[str] = []
+
+            async def _turn(label):
+                from gateway.run import _profile_runtime_scope
+
+                with _profile_runtime_scope(home_a):
+                    await runner._ensure_profile_mcp_tools()
+                finished.append(label)
+
+            first = asyncio.create_task(_turn("first"))
+            # Let the owner claim and block inside the readiness pass.
+            for _ in range(100):
+                await asyncio.sleep(0)
+                if entered.is_set():
+                    break
+            assert entered.is_set(), "owner never entered the readiness pass"
+
+            second = asyncio.create_task(_turn("second"))
+            for _ in range(100):
+                await asyncio.sleep(0)
+            assert finished == [], (
+                "the second turn returned while the shared readiness pass was "
+                "still running — its agent would snapshot tools that have not "
+                "been discovered yet"
+            )
+
+            hold.set()
+            await asyncio.wait_for(asyncio.gather(first, second), timeout=5)
+            # Exactly ONE discovery pass served both turns.
+            assert calls == ["run"]
+            assert sorted(finished) == ["first", "second"]
+
+        asyncio.run(_go())
+
+    def test_waiter_cancellation_does_not_cancel_the_shared_pass(self, profiles):
+        home_a, _home_b = profiles
+        runner = self._runner()
+
+        async def _go():
+            hold = asyncio.Event()
+            calls, entered = self._instrumented(runner, home_a, hold=hold)
+
+            from gateway.run import _profile_runtime_scope
+
+            async def _turn():
+                with _profile_runtime_scope(home_a):
+                    await runner._ensure_profile_mcp_tools()
+
+            owner = asyncio.create_task(_turn())
+            for _ in range(100):
+                await asyncio.sleep(0)
+                if entered.is_set():
+                    break
+            waiter = asyncio.create_task(_turn())
+            for _ in range(50):
+                await asyncio.sleep(0)
+
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+
+            hold.set()
+            await asyncio.wait_for(owner, timeout=5)
+            assert calls == ["run"], "the owner's pass was collateral damage"
+
+        asyncio.run(_go())
+
+    def test_deadline_is_stamped_on_completion_and_then_honoured(self, profiles):
+        home_a, _home_b = profiles
+        runner = self._runner()
+
+        async def _go():
+            calls, _entered = self._instrumented(runner, home_a)
+            from gateway.run import _profile_runtime_scope
+
+            with _profile_runtime_scope(home_a):
+                await runner._ensure_profile_mcp_tools()
+                assert calls == ["run"]
+                # Second call inside the interval is rate-limited...
+                await runner._ensure_profile_mcp_tools()
+                assert calls == ["run"]
+
+            key = mcp_profile.canonical_profile_key(str(home_a))
+            _lock, due_at, in_flight = runner._profile_mcp_readiness_state()
+            assert in_flight == {}, "the in-flight claim leaked past completion"
+            assert key in due_at
+
+            # ...and allowed again once the interval elapses.
+            due_at[key] = 0.0
+            with _profile_runtime_scope(home_a):
+                await runner._ensure_profile_mcp_tools()
+            assert calls == ["run", "run"]
+
+        asyncio.run(_go())
+
+    def test_two_profiles_do_not_share_a_readiness_claim(self, profiles):
+        home_a, home_b = profiles
+        runner = self._runner()
+
+        async def _go():
+            hold = asyncio.Event()
+            seen: list[str] = []
+
+            async def _fake_readiness():
+                from hermes_constants import get_hermes_home
+
+                seen.append(mcp_profile.canonical_profile_key(str(get_hermes_home())))
+                await hold.wait()
+
+            runner._run_profile_mcp_readiness = _fake_readiness
+            from gateway.run import _profile_runtime_scope
+
+            async def _turn(home):
+                with _profile_runtime_scope(home):
+                    await runner._ensure_profile_mcp_tools()
+
+            tasks = [
+                asyncio.create_task(_turn(home_a)),
+                asyncio.create_task(_turn(home_b)),
+            ]
+            for _ in range(100):
+                await asyncio.sleep(0)
+                if len(seen) == 2:
+                    break
+            hold.set()
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+
+            assert sorted(seen) == sorted(
+                [
+                    mcp_profile.canonical_profile_key(str(home_a)),
+                    mcp_profile.canonical_profile_key(str(home_b)),
+                ]
+            ), "one profile's readiness claim suppressed the other's"
+
+        asyncio.run(_go())
+
+    def test_readiness_state_is_built_once_under_thread_contention(self):
+        """The lazy state must not fork into per-thread locks and maps."""
+        runner = self._runner()
+        results: list[tuple] = []
+        barrier = threading.Barrier(8)
+
+        def _build():
+            barrier.wait()
+            results.append(runner._profile_mcp_readiness_state())
+
+        threads = [threading.Thread(target=_build) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert len(results) == 8
+        first = results[0]
+        assert all(r is first for r in results), (
+            "concurrent turns built separate readiness locks/maps, so neither "
+            "excluded the other"
+        )
+
+    def test_in_flight_future_from_a_dead_loop_is_replaced(self, profiles):
+        """A future from a previous loop can never complete for this one."""
+        home_a, _home_b = profiles
+        runner = self._runner()
+        key = mcp_profile.canonical_profile_key(str(home_a))
+
+        def _make_orphan():
+            async def _mk():
+                return asyncio.get_running_loop().create_future()
+
+            return asyncio.run(_mk())
+
+        _lock, _due_at, in_flight = runner._profile_mcp_readiness_state()
+        in_flight[key] = _make_orphan()
+
+        async def _go():
+            calls, _entered = self._instrumented(runner, home_a)
+            from gateway.run import _profile_runtime_scope
+
+            with _profile_runtime_scope(home_a):
+                await asyncio.wait_for(
+                    runner._ensure_profile_mcp_tools(), timeout=5
+                )
+            assert calls == ["run"]
+
+        asyncio.run(_go())

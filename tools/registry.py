@@ -278,11 +278,31 @@ _check_fn_cache_lock = threading.Lock()
 CHECK_FN_CACHE_BYPASS = ""
 _NO_CACHE_CHECK_FNS: Set[Callable] = set()
 
+#: Marker attribute an availability check may set on ITSELF to opt out of the
+#: TTL cache. Preferred over ``_NO_CACHE_CHECK_FNS`` for checks built per
+#: registration — MCP creates one closure per server per discovery pass, and a
+#: process-global set of them would grow without bound in a long-lived gateway.
+CHECK_FN_NO_CACHE_ATTR = "_hermes_no_cache_check_fn"
+
 
 def no_cache_check_fn(fn: Callable) -> Callable:
     """Mark a local, config-backed availability check as uncached."""
     _NO_CACHE_CHECK_FNS.add(fn)
+    try:
+        setattr(fn, CHECK_FN_NO_CACHE_ATTR, True)
+    except (AttributeError, TypeError):  # pragma: no cover - builtins/slots
+        pass
     return fn
+
+
+def is_no_cache_check_fn(fn: Callable) -> bool:
+    """True when *fn* must be re-probed on every call rather than cached."""
+    if getattr(fn, CHECK_FN_NO_CACHE_ATTR, False):
+        return True
+    try:
+        return fn in _NO_CACHE_CHECK_FNS
+    except TypeError:  # pragma: no cover - unhashable check_fn
+        return False
 
 
 def _prune_check_fn_caches(now: float) -> None:
@@ -312,9 +332,21 @@ def check_fn_cache_scope() -> Optional[str]:
     from leaking into any unrelated session.
 
     Single-profile processes intentionally keep the historical process-wide
-    cache. A multiplex gateway installs a Hermes-home override for every
-    profile turn, so the canonical profile key is the stable isolation
-    boundary across repeated turns for that profile.
+    cache. Any process acting for a SPECIFIC profile installs a Hermes-home
+    override for the duration, so the canonical profile key is the stable
+    isolation boundary across repeated turns for that profile.
+
+    The override — not ``is_multiplex_active()`` — is what decides. The
+    multiplex flag is a *messaging gateway* concept: ``gateway/run.py`` is the
+    only production caller of ``set_multiplex_active``. The desktop/TUI
+    gateway also serves many profiles from one process (``session
+    ["profile_home"]`` → ``set_hermes_home_override`` per agent build) but
+    never sets that flag, so gating on it collapsed every desktop profile onto
+    a single ``(check_fn, None)`` cache key. MCP availability checks are
+    registered under one shared public tool name across profiles, so that key
+    let profile A's "toolhive is available" verdict answer for profile B for
+    the full TTL — advertising a tool B cannot dispatch, or (in the other
+    direction) suppressing one B genuinely has.
     """
     try:
         from gateway.session_context import get_session_env
@@ -330,19 +362,22 @@ def check_fn_cache_scope() -> Optional[str]:
         pass
 
     try:
-        from agent.secret_scope import is_multiplex_active
-
-        if not is_multiplex_active():
-            return None
         from hermes_constants import get_hermes_home_override
 
         override = get_hermes_home_override()
-        if not override:
-            return CHECK_FN_CACHE_BYPASS
-        return str(Path(override).expanduser().resolve())
+        if override:
+            return str(Path(override).expanduser().resolve())
+
+        from agent.secret_scope import is_multiplex_active
+
+        if not is_multiplex_active():
+            # Single-profile process with no override: historical behaviour.
+            return None
+        # Multiplexing, but the profile identity is unresolved — never alias.
+        return CHECK_FN_CACHE_BYPASS
     except Exception:
         # Fail closed: bypass both cache layers rather than aliasing requests
-        # whose multiplex profile identity could not be resolved.
+        # whose profile identity could not be resolved.
         return CHECK_FN_CACHE_BYPASS
 
 
@@ -364,7 +399,7 @@ def _run_check_fn_uncached(fn: Callable, *, unresolved_scope: bool = False) -> b
 def _check_fn_cached(fn: Callable) -> bool:
     """Return bool(fn()), TTL-cached across calls."""
     now = time.monotonic()
-    if fn in _NO_CACHE_CHECK_FNS:
+    if is_no_cache_check_fn(fn):
         return _run_check_fn_uncached(fn)
     scope = check_fn_cache_scope()
     if scope == CHECK_FN_CACHE_BYPASS:
@@ -434,6 +469,9 @@ def get_cached_check_fn_result(fn: Callable) -> Optional[bool]:
     path. Returns ``None`` when there is no fresh cached verdict.
     """
     now = time.monotonic()
+    if is_no_cache_check_fn(fn):
+        # Never cached, so there is never a stored verdict to report.
+        return None
     scope = check_fn_cache_scope()
     if scope == CHECK_FN_CACHE_BYPASS:
         # Unresolved profile identity bypasses the cache entirely; there is no

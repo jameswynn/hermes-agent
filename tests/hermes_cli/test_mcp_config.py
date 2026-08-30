@@ -53,6 +53,14 @@ def _make_args(**kwargs):
         "preset": None,
         "env": None,
         "mcp_action": None,
+        # --sa-* defaults mirror hermes_cli/subcommands/mcp.py.
+        "sa_grant_type": "authentik_app_password",
+        "sa_token_url": None,
+        "sa_client_id": None,
+        "sa_username": None,
+        "sa_password_env": None,
+        "sa_scope": None,
+        "sa_client_secret_env": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -276,6 +284,187 @@ class TestMcpAdd:
         assert srv["command"] == "npx"
         assert srv["args"] == ["-y", "test-mcp-server"]
         assert "env" not in srv
+
+
+class TestMcpAddServiceAccount:
+    """``hermes mcp add --auth service_account`` end to end.
+
+    The branch used to be unreachable: ``--auth`` did not accept
+    ``service_account``, and even if it had, nothing populated the required
+    ``service_account`` block, so validation refused every invocation.
+    """
+
+    def _probe_ok(self, monkeypatch, seen):
+        def mock_probe(name, config, **kw):
+            seen.append(config)
+            return [("ping", "Ping the server")]
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server", mock_probe
+        )
+        monkeypatch.setattr("builtins.input", lambda _: "")
+
+    def test_parser_accepts_service_account_and_sa_flags(self):
+        """argparse must not reject the documented invocation."""
+        from hermes_cli.subcommands.mcp import build_mcp_parser
+
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command")
+        build_mcp_parser(sub, cmd_mcp=lambda a: None)
+
+        args = parser.parse_args([
+            "mcp", "add", "toolhive",
+            "--url", "https://toolhive.example/mcp",
+            "--auth", "service_account",
+            "--sa-token-url", "https://idp.example/application/o/th/token/",
+            "--sa-client-id", "toolhive",
+            "--sa-username", "svc",
+            "--sa-password-env", "AUTHENTIK_SVC_APP_PASSWORD",
+            "--sa-scope", "openid profile",
+        ])
+        assert args.auth == "service_account"
+        assert args.sa_token_url == "https://idp.example/application/o/th/token/"
+        assert args.sa_grant_type == "authentik_app_password"
+
+    def test_add_writes_service_account_block(self, tmp_path, capsys, monkeypatch):
+        seen: list[dict] = []
+        self._probe_ok(monkeypatch, seen)
+
+        from hermes_cli.mcp_config import cmd_mcp_add
+
+        cmd_mcp_add(_make_args(
+            name="toolhive",
+            url="https://toolhive.example/mcp",
+            auth="service_account",
+            sa_token_url="https://idp.example/application/o/th/token/",
+            sa_client_id="toolhive",
+            sa_username="svc",
+            sa_password_env="AUTHENTIK_SVC_APP_PASSWORD",
+            sa_scope="openid profile groups",
+        ))
+        out = capsys.readouterr().out
+        assert "Saved" in out
+
+        from hermes_cli.config import read_raw_config
+
+        srv = read_raw_config()["mcp_servers"]["toolhive"]
+        assert srv["auth"] == "service_account"
+        assert srv["service_account"] == {
+            "grant_type": "authentik_app_password",
+            "token_url": "https://idp.example/application/o/th/token/",
+            "client_id": "toolhive",
+            "username": "svc",
+            "password_env": "AUTHENTIK_SVC_APP_PASSWORD",
+            "scope": "openid profile groups",
+        }
+        # The probe must see the block too, or `mcp add` would report a
+        # successful discovery the runtime cannot reproduce.
+        assert seen[0]["service_account"]["client_id"] == "toolhive"
+
+    def test_no_secret_value_reaches_config(self, tmp_path, monkeypatch):
+        """Only env-var NAMES are persisted; there is no value-taking flag."""
+        seen: list[dict] = []
+        self._probe_ok(monkeypatch, seen)
+
+        from hermes_cli.mcp_config import cmd_mcp_add
+
+        monkeypatch.setenv("AUTHENTIK_SVC_APP_PASSWORD", "hunter2-not-in-config")
+        cmd_mcp_add(_make_args(
+            name="toolhive",
+            url="https://toolhive.example/mcp",
+            auth="service_account",
+            sa_token_url="https://idp.example/token/",
+            sa_client_id="toolhive",
+            sa_username="svc",
+            sa_password_env="AUTHENTIK_SVC_APP_PASSWORD",
+        ))
+        raw = (tmp_path / "config.yaml").read_text(encoding="utf-8")
+        assert "hunter2-not-in-config" not in raw
+
+    def test_missing_required_fields_refuses_to_save(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        probe_calls: list[str] = []
+
+        def mock_probe(name, config, **kw):  # pragma: no cover — must not run
+            probe_calls.append(name)
+            return []
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server", mock_probe
+        )
+        from hermes_cli.mcp_config import cmd_mcp_add
+
+        cmd_mcp_add(_make_args(
+            name="toolhive",
+            url="https://toolhive.example/mcp",
+            auth="service_account",
+            sa_token_url="https://idp.example/token/",
+            # client_id / username / password_env omitted
+        ))
+        out = capsys.readouterr().out
+        assert "client_id is required" in out
+        assert "--sa-client-id" in out
+        assert probe_calls == []
+
+        from hermes_cli.config import read_raw_config
+
+        assert "toolhive" not in read_raw_config().get("mcp_servers", {})
+
+    def test_plaintext_token_url_refused(self, tmp_path, capsys, monkeypatch):
+        """The https:// requirement is enforced on the CLI path too."""
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda *a, **k: pytest.fail("must not probe"),
+        )
+        from hermes_cli.mcp_config import cmd_mcp_add
+
+        cmd_mcp_add(_make_args(
+            name="toolhive",
+            url="https://toolhive.example/mcp",
+            auth="service_account",
+            sa_token_url="http://idp.example/token/",
+            sa_client_id="toolhive",
+            sa_username="svc",
+            sa_password_env="AUTHENTIK_SVC_APP_PASSWORD",
+        ))
+        assert "must use https://" in capsys.readouterr().out
+
+    def test_sa_flags_without_auth_flag_are_refused(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """Silently dropping --sa-* would save a server that cannot auth."""
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda *a, **k: pytest.fail("must not probe"),
+        )
+        from hermes_cli.mcp_config import cmd_mcp_add
+
+        cmd_mcp_add(_make_args(
+            name="toolhive",
+            url="https://toolhive.example/mcp",
+            sa_token_url="https://idp.example/token/",
+        ))
+        out = capsys.readouterr().out
+        assert "--sa-token-url" in out
+        assert "require --auth service_account" in out
+
+    def test_service_account_requires_http_transport(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda *a, **k: pytest.fail("must not probe"),
+        )
+        from hermes_cli.mcp_config import cmd_mcp_add
+
+        cmd_mcp_add(_make_args(
+            name="toolhive",
+            mcp_command="npx",
+            args=["@mcp/thing"],
+            auth="service_account",
+        ))
+        assert "requires an HTTP server" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------

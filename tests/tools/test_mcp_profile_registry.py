@@ -889,10 +889,15 @@ class TestTokenLifecycleEdgeCases:
         auth._mem_token = t1
 
         cleared: list = []
-        issued = [t1, _CachedToken("T3", _time.time() + 3600, lifetime=3600.0)]
+        # Exactly ONE exchange is expected. The first leg is served from the
+        # valid in-memory token without opening a token client at all (see
+        # ``_acquire_token_with_client``); only the 401 retry mints.
+        acquisitions: list[str] = []
+        t3 = _CachedToken("T3", _time.time() + 3600, lifetime=3600.0)
 
         async def _acquire(self_inner, http_client):
-            return issued.pop(0)
+            acquisitions.append("call")
+            return t3
 
         with patch.object(ServiceAccountAuth, "_acquire_token", _acquire), patch(
             "tools.mcp_service_account._delete_token_cache",
@@ -901,13 +906,15 @@ class TestTokenLifecycleEdgeCases:
             request = MagicMock()
             request.headers = {}
             gen = auth.async_auth_flow(request)
-            await gen.__anext__()
+            sent = await gen.__anext__()
+            assert sent.headers["Authorization"] == "Bearer T1"
             resp = MagicMock()
             resp.status_code = 401
             retry = await gen.asend(resp)
 
         assert cleared == [auth._cache_path]
         assert retry.headers["Authorization"] == "Bearer T3"
+        assert acquisitions == ["call"]
 
 
 # ---------------------------------------------------------------------------
@@ -1274,3 +1281,178 @@ class TestRealPathIntegration:
 
         for name in registered[str(home_a)]:
             registry.deregister(name)
+
+
+# ---------------------------------------------------------------------------
+# The MCP event loop is process-global; idleness is not
+# ---------------------------------------------------------------------------
+
+
+class TestLoopIdlenessIsProcessWide:
+    """``_stop_mcp_loop_if_idle`` must consider EVERY profile's registry.
+
+    ``_mcp_loop`` is one loop for the whole process, shared by every profile's
+    long-lived ``MCPServerTask.run()`` and every stdio child those tasks own.
+    The idle check, though, used to read ``_servers`` / ``_server_connecting``,
+    which are views onto the *ambient* profile.  A dashboard or CLI probe
+    running under profile B therefore saw an empty registry, concluded the loop
+    was idle, and stopped it — cancelling profile A's server tasks and killing
+    A's stdio children.  A must be able to veto B's teardown.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _restore_loop(self):
+        yield
+        mcp_tool._stop_mcp_loop()
+
+    def test_profile_b_probe_cannot_stop_profile_a_loop(self, tmp_path):
+        home_a, home_b = _profile_homes(tmp_path)
+
+        mcp_tool._ensure_mcp_loop()
+        loop = mcp_tool._mcp_loop
+        assert loop is not None and loop.is_running()
+
+        with mcp_profile.profile_scope(home_a):
+            mcp_tool._servers["toolhive"] = MagicMock()
+
+        with mcp_profile.profile_scope(home_b):
+            assert mcp_tool._servers == {}
+            stopped = mcp_tool._stop_mcp_loop_if_idle()
+
+        assert stopped is False, (
+            "profile B's probe stopped the shared MCP loop while profile A "
+            "still owns a registered server on it"
+        )
+        assert mcp_tool._mcp_loop is loop
+        assert loop.is_running()
+
+    def test_profile_b_probe_cannot_stop_loop_while_a_is_connecting(self, tmp_path):
+        """An in-flight connect in another profile also vetoes the stop.
+
+        ``_server_connecting`` is the window where a task exists on the loop
+        but is not yet in ``_servers`` — the exact interval a concurrent probe
+        is most likely to land in.
+        """
+        home_a, home_b = _profile_homes(tmp_path)
+
+        mcp_tool._ensure_mcp_loop()
+        loop = mcp_tool._mcp_loop
+
+        with mcp_profile.profile_scope(home_a):
+            mcp_tool._server_connecting.add("toolhive")
+
+        with mcp_profile.profile_scope(home_b):
+            stopped = mcp_tool._stop_mcp_loop_if_idle()
+
+        assert stopped is False
+        assert mcp_tool._mcp_loop is loop
+        assert loop.is_running()
+
+    def test_genuinely_idle_loop_still_stops(self, tmp_path):
+        """The veto is not blanket: no profile holding state means stop."""
+        home_a, home_b = _profile_homes(tmp_path)
+
+        mcp_tool._ensure_mcp_loop()
+        assert mcp_tool._mcp_loop is not None
+
+        # Touch both registries so they exist but stay empty of server state.
+        for home in (home_a, home_b):
+            with mcp_profile.profile_scope(home):
+                mcp_tool._server_connect_errors["toolhive"] = "boom"
+
+        with mcp_profile.profile_scope(home_b):
+            assert mcp_tool._stop_mcp_loop_if_idle() is True
+        assert mcp_tool._mcp_loop is None
+
+
+# ---------------------------------------------------------------------------
+# The state views must behave like the built-ins they replace
+# ---------------------------------------------------------------------------
+
+
+class TestProfileScopedSetOperators:
+    """``ProfileScopedSet`` stands in for ``set`` at 60+ MCP call sites.
+
+    ``collections.abc.Set`` builds every operator result through
+    ``cls._from_iterable(<generator>)``. The default implementation is
+    ``cls(iterable)``, but this class's ``__init__`` takes a registry FIELD
+    NAME — so ``_server_connecting | {...}`` raised ``TypeError: attribute
+    name must be string, not 'generator'`` instead of returning a set, and so
+    did every other operator, on BOTH operand orders (``set.__or__`` returns
+    ``NotImplemented`` for a non-``set``, after which Python calls the view's
+    reflected method).
+
+    The result type matters as much as the absence of the crash: a view is an
+    alias for one field of one profile's registry, so a derived value must be
+    a detached plain ``set``. Returning another view would re-bind to whatever
+    profile happened to be active when it was next read — the exact
+    cross-profile aliasing this module exists to prevent.
+    """
+
+    @pytest.fixture
+    def view(self, tmp_path):
+        home_a, _home_b = _profile_homes(tmp_path)
+        with mcp_profile.profile_scope(home_a):
+            v = mcp_profile.ProfileScopedSet("server_connecting")
+            v.add("toolhive")
+            yield v
+
+    def test_binary_operators_both_orders(self, view):
+        assert view | {"other"} == {"toolhive", "other"}
+        assert {"other"} | view == {"toolhive", "other"}
+        assert view & {"toolhive", "nope"} == {"toolhive"}
+        assert {"toolhive", "nope"} & view == {"toolhive"}
+        assert view - {"toolhive"} == set()
+        assert {"toolhive", "other"} - view == {"other"}
+        assert view ^ {"other"} == {"toolhive", "other"}
+        assert {"other"} ^ view == {"toolhive", "other"}
+
+    def test_operator_results_are_detached_plain_sets(self, view, tmp_path):
+        """A derived set must not follow the ambient profile around."""
+        home_a, home_b = _profile_homes(tmp_path)
+        derived = view | {"other"}
+        assert type(derived) is set
+        with mcp_profile.profile_scope(home_b):
+            # B's registry is empty; the derived value must not notice.
+            assert derived == {"toolhive", "other"}
+            assert mcp_profile.ProfileScopedSet("server_connecting") == set()
+
+    def test_in_place_operators_mutate_this_profiles_registry(self, tmp_path):
+        home_a, home_b = _profile_homes(tmp_path)
+        with mcp_profile.profile_scope(home_a):
+            view = mcp_profile.ProfileScopedSet("server_connecting")
+            view |= {"toolhive", "other"}
+            assert view == {"toolhive", "other"}
+            # ``MutableSet.__iand__`` is implemented as ``self - it``, so it
+            # went down the same broken ``_from_iterable`` path.
+            view &= {"toolhive"}
+            assert view == {"toolhive"}
+            view ^= {"other"}
+            assert view == {"toolhive", "other"}
+            view -= {"other"}
+            assert view == {"toolhive"}
+            assert mcp_profile.registry_for(home_a).server_connecting == {"toolhive"}
+        with mcp_profile.profile_scope(home_b):
+            assert mcp_profile.ProfileScopedSet("server_connecting") == set()
+
+    def test_named_set_methods(self, view):
+        assert view.union({"other"}) == {"toolhive", "other"}
+        assert view.intersection({"toolhive", "nope"}) == {"toolhive"}
+        assert view.difference({"toolhive"}) == set()
+        assert view.symmetric_difference({"other"}) == {"toolhive", "other"}
+        assert view.issubset({"toolhive", "other"}) is True
+        assert view.issuperset({"toolhive"}) is True
+        assert view.isdisjoint({"other"}) is True
+        view.intersection_update({"toolhive", "other"})
+        assert view == {"toolhive"}
+        view.symmetric_difference_update({"toolhive"})
+        assert view == set()
+
+    def test_comparisons_and_membership_still_work(self, view):
+        assert view == {"toolhive"}
+        assert view != {"other"}
+        assert "toolhive" in view
+        assert view <= {"toolhive", "other"}
+        assert view < {"toolhive", "other"}
+        assert view >= {"toolhive"}
+        assert len(view) == 1
