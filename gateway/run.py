@@ -2413,6 +2413,20 @@ def _ensure_profile_mcp_discovery(*, wait: bool = True) -> None:
             )
     except Exception:
         logger.debug("Profile MCP discovery readiness failed", exc_info=True)
+@_contextmanager
+def _optional_profile_runtime_scope(profile_home: "Optional[Path]"):
+    """``_profile_runtime_scope`` when a profile is bound, else a no-op.
+
+    Lets a code path that is profile-scoped only under multiplexing keep ONE
+    body instead of branching around the ``with``. Entering it on the thread
+    that does the work matters: both seams are ContextVars, and neither
+    ``run_in_executor`` nor a bare worker thread inherits the caller's context.
+    """
+    if profile_home is None:
+        yield
+        return
+    with _profile_runtime_scope(profile_home):
+        yield
 
 
 def load_gateway_config_for_runner() -> "GatewayConfig":
@@ -24608,43 +24622,211 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
 
+    def _profile_target_for_source(
+        self, source: SessionSource
+    ) -> Tuple[Optional[str], Optional["Path"]]:
+        """``(profile_name, profile_home)`` this source's turns actually run in.
+
+        ``(None, None)`` on a single-profile gateway — callers then keep the
+        unscoped, process-global behaviour they had before multiplexing
+        existed.  Under multiplexing the name is always non-empty (``"default"``
+        for the active profile).
+
+        The name is READ BACK OUT of the session key rather than re-derived
+        from the source: a second resolution ladder is the one way a
+        profile-scoped operation and the session keys it filters on could
+        disagree.  ``_session_key_for_source`` prefers ``source.profile`` and
+        falls back to the active profile, while ``_resolve_profile_home_for_source``
+        also re-runs route matching — so for a source that bypassed
+        ``build_source`` (routing never stamped ``source.profile``) the two
+        ladders return different names, and a filter built from the second one
+        would match no cached agent at all.
+        """
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return None, None
+        from gateway.session import session_key_profile
+
+        home = self._resolve_profile_home_for_source(source)
+        name = session_key_profile(self._session_key_for_source(source)) or "default"
+        return name, home
+
+    def _refresh_profile_agent_tools(
+        self, profile_name: Optional[str]
+    ) -> Tuple[int, int]:
+        """Rebuild cached agents' tool snapshots for ONE profile.
+
+        Returns ``(refreshed, skipped_active)``.  ``profile_name is None`` means
+        "not multiplexed" and refreshes every cached agent, which is what a
+        single-profile gateway has always done.
+
+        Two guards a process-global refresh does not have:
+
+        * **Profile filter.** Session keys are namespaced ``agent:<profile>:…``
+          (:func:`gateway.session.session_key_profile`), so a reload issued from
+          profile A rebuilds only A's agents.  Refreshing every cached agent
+          handed A's freshly-discovered tool list to B's live sessions.
+        * **Active-turn skip.** ``agent.tools`` is what ``build_api_kwargs``
+          serialises into the request.  Swapping it under a session that is
+          mid-turn changes the tool prefix between two API calls of the SAME
+          turn — invalidating the provider prompt cache the turn already paid
+          for, and silently mutating a toolset whose owner never asked for a
+          reload.  Those sessions keep their snapshot and are reported back to
+          the caller, which surfaces them instead of leaving it silent; they
+          pick the new tools up at their next turn boundary.
+        """
+        from gateway.session import session_key_profile
+        from tools.mcp_tool import refresh_agent_mcp_tools
+
+        cache = getattr(self, "_agent_cache", None)
+        cache_lock = getattr(self, "_agent_cache_lock", None)
+        if cache_lock is None or not cache:
+            return 0, 0
+
+        scoped = profile_name is not None
+        target = (profile_name or "").strip()
+        target = None if target in ("", "default") else target
+
+        with cache_lock:
+            entries = list(cache.items())
+
+        refreshed = 0
+        skipped_active = 0
+        for session_key, entry in entries:
+            if scoped and session_key_profile(session_key) != target:
+                continue
+            agent = entry[0] if isinstance(entry, tuple) else entry
+            if agent is None or agent is _AGENT_PENDING_SENTINEL:
+                continue
+            if self._is_session_running(session_key):
+                skipped_active += 1
+                continue
+            try:
+                # Preserve each cached agent's build-time toolset selection
+                # EXACTLY: a gateway session built with a restricted
+                # enabled_toolsets (e.g. ["safe"]) must NOT silently gain tools
+                # after a reload. This is the opposite of the interactive
+                # CLI/TUI /reload-mcp, which is a single user re-applying their
+                # own config edit; gateway agents are per-session and may be
+                # deliberately locked down. (Contract is asserted by
+                # test_reload_mcp_preserves_per_agent_toolset_overrides.)
+                refresh_agent_mcp_tools(agent, quiet_mode=True)
+                refreshed += 1
+            except Exception as exc:
+                logger.debug(
+                    "Failed to update cached agent tools for %s after MCP "
+                    "reload: %s", session_key, exc,
+                )
+        return refreshed, skipped_active
+
     async def _execute_mcp_reload(self, event: MessageEvent) -> str:
         """Actually disconnect, reconnect, and notify MCP tool changes.
 
         Split out from ``_handle_reload_mcp_command`` so the confirmation
         wrapper can invoke the same path whether the user confirmed via
         button, text reply, or has the confirm gate disabled.
+
+        On a MULTIPLEXED gateway the whole operation is bound to the calling
+        session's profile: its HERMES_HOME and secret scope (so discovery reads
+        THAT profile's ``mcp_servers`` and interpolates THAT profile's
+        credentials), its slice of the MCP registry (so the teardown leaves
+        every other profile connected), and its own cached agents.  Unscoped,
+        the reload shut down every profile's servers and then rediscovered from
+        the multiplexer's own config — which is how a reload from one profile
+        deleted another profile's servers outright.
+
+        Single-profile gateways resolve ``(None, None)`` and take the original
+        process-global path unchanged.
         """
         loop = asyncio.get_running_loop()
+
+        # Resolving the target profile must succeed before anything is torn
+        # down. Falling back to an unscoped reload here would be precisely the
+        # destructive behaviour this path exists to prevent.
         try:
-            from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
+            profile_name, profile_home = self._profile_target_for_source(event.source)
+        except Exception as exc:
+            logger.warning("MCP reload: could not resolve target profile: %s", exc)
+            return t("gateway.reload_mcp.failed", error=exc)
 
-            # Capture old server names before shutdown
-            with _lock:
-                old_servers = set(_servers.keys())
+        try:
+            from tools.mcp_tool import (
+                _lock,
+                _servers,
+                discover_mcp_tools,
+                mcp_configured_server_names,
+                mcp_scope_conflicts,
+                mcp_scope_key,
+                mcp_servers_in_scope,
+                shutdown_mcp_servers,
+            )
 
-            # Read new config before shutting down, so we know what will be added/removed
-            # Shutdown existing connections
-            await loop.run_in_executor(None, shutdown_mcp_servers)
+            scope = mcp_scope_key(profile_home) if profile_home is not None else None
 
-            # Reconnect by discovering tools (reads config.yaml fresh)
-            new_tools = await loop.run_in_executor(None, discover_mcp_tools)
+            def _servers_now() -> set:
+                if scope is None:
+                    with _lock:
+                        return set(_servers.keys())
+                return mcp_servers_in_scope(scope)
 
-            # Compute what changed
-            with _lock:
-                connected_servers = set(_servers.keys())
+            def _reload() -> tuple:
+                """Tear down + rediscover under the target profile's runtime.
+
+                One executor job, not two: the teardown and the rediscovery
+                must not straddle a scope change, and ``run_in_executor`` does
+                NOT copy the caller's context — the HERMES_HOME and secret-scope
+                ContextVars have to be re-bound on THIS thread or discovery
+                silently reads the multiplexer's own config and credentials.
+                """
+                with _optional_profile_runtime_scope(profile_home):
+                    before = _servers_now()
+                    # Read the profile's server names ONCE, inside its scope,
+                    # and use them for both halves: the teardown clears the
+                    # backoff of the ones that previously failed to connect
+                    # (they are unowned, so a scope-only teardown can't reach
+                    # them and rediscovery would skip them), and the report
+                    # below flags the ones a DIFFERENT profile registered
+                    # first. The flat registry can only hold one server per
+                    # name, so those are conflicts rather than servers of ours
+                    # that connected.
+                    configured = (
+                        mcp_configured_server_names() if scope is not None else set()
+                    )
+                    shutdown_mcp_servers(
+                        scope=scope, reset_cooldown_for=configured,
+                    )
+                    tools = discover_mcp_tools()
+                    after = _servers_now()
+                    conflicts = (
+                        mcp_scope_conflicts(configured, scope)
+                        if scope is not None
+                        else {}
+                    )
+                    return before, tools, after, conflicts
+
+            old_servers, new_tools, connected_servers, conflicts = (
+                await loop.run_in_executor(None, _reload)
+            )
 
             added = connected_servers - old_servers
             removed = old_servers - connected_servers
             reconnected = connected_servers & old_servers
 
             lines = [t("gateway.reload_mcp.header")]
+            if profile_name:
+                lines.append(t("gateway.reload_mcp.profile", profile=profile_name))
             if reconnected:
                 lines.append(t("gateway.reload_mcp.reconnected", names=", ".join(sorted(reconnected))))
             if added:
                 lines.append(t("gateway.reload_mcp.added", names=", ".join(sorted(added))))
             if removed:
                 lines.append(t("gateway.reload_mcp.removed", names=", ".join(sorted(removed))))
+            if conflicts:
+                lines.append(
+                    t(
+                        "gateway.reload_mcp.name_conflict",
+                        names=", ".join(sorted(conflicts)),
+                    )
+                )
             if not connected_servers:
                 lines.append(t("gateway.reload_mcp.none_connected"))
             else:
@@ -24656,33 +24838,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # that was just added or reconnected. The user has already
             # consented to the prompt-cache invalidation via the slash-confirm
             # gate in _handle_reload_mcp_command before we reach this point.
-            try:
-                from tools.mcp_tool import refresh_agent_mcp_tools
-                _cache = getattr(self, "_agent_cache", None)
-                _cache_lock = getattr(self, "_agent_cache_lock", None)
-                if _cache_lock is not None and _cache:
-                    with _cache_lock:
-                        for _sess_key, _entry in list(_cache.items()):
-                            try:
-                                _agent = _entry[0] if isinstance(_entry, tuple) else _entry
-                            except Exception:
-                                continue
-                            if _agent is None:
-                                continue
-                            # Preserve each cached agent's build-time toolset
-                            # selection EXACTLY: a gateway session built with a
-                            # restricted enabled_toolsets (e.g. ["safe"]) must
-                            # NOT silently gain tools after a reload. This is the
-                            # opposite of the interactive CLI/TUI /reload-mcp,
-                            # which is a single user re-applying their own config
-                            # edit; gateway agents are per-session and may be
-                            # deliberately locked down. (Contract is asserted by
-                            # test_reload_mcp_preserves_per_agent_toolset_overrides.)
-                            refresh_agent_mcp_tools(_agent, quiet_mode=True)
-            except Exception as _exc:
-                logger.debug(
-                    "Failed to update cached agent tools after MCP reload: %s",
-                    _exc,
+            _refreshed, _skipped_active = self._refresh_profile_agent_tools(profile_name)
+            logger.debug(
+                "MCP reload (profile %s): refreshed %d cached agent(s), "
+                "skipped %d mid-turn",
+                profile_name or "(default)", _refreshed, _skipped_active,
+            )
+            if _skipped_active:
+                lines.append(
+                    t("gateway.reload_mcp.active_turns_skipped", count=_skipped_active)
                 )
 
             # Inject a message at the END of the session history so the
@@ -24712,7 +24876,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "\n".join(lines)
 
         except Exception as e:
-            logger.warning("MCP reload failed: %s", e)
+            logger.warning(
+                "MCP reload failed for profile %s: %s", profile_name or "(default)", e,
+            )
+            if profile_name:
+                return t(
+                    "gateway.reload_mcp.profile_failed",
+                    profile=profile_name,
+                    error=e,
+                )
             return t("gateway.reload_mcp.failed", error=e)
 
 

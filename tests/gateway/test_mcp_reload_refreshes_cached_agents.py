@@ -174,3 +174,99 @@ async def test_reload_mcp_preserves_per_agent_toolset_overrides():
     assert captured_calls, "get_tool_definitions was never called to refresh the cache"
     assert captured_calls[0]["enabled_toolsets"] == ["safe"]
     assert captured_calls[0]["disabled_toolsets"] == ["terminal"]
+
+
+@pytest.mark.asyncio
+async def test_reload_mcp_scopes_shutdown_to_calling_profile(monkeypatch, tmp_path):
+    """A multiplexed reload must tear down only the calling profile."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")},
+        multiplex_profiles=True,
+    )
+    runner._agent_cache = OrderedDict()
+    runner._agent_cache_lock = __import__("threading").Lock()
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key="agent:anton:matrix:dm:c1",
+        session_id="sess-anton",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store.append_to_transcript = MagicMock()
+    runner._profile_target_for_source = MagicMock(
+        return_value=("anton", tmp_path / "anton")
+    )
+
+    calls = []
+
+    def fake_shutdown(*, scope=None, reset_cooldown_for=None):
+        calls.append(("shutdown", scope, set(reset_cooldown_for or ())))
+        return ["toolhive"]
+
+    with (
+        patch("tools.mcp_tool.shutdown_mcp_servers", side_effect=fake_shutdown),
+        patch("tools.mcp_tool.discover_mcp_tools", return_value=[]),
+        patch.dict("tools.mcp_tool._servers", {}, clear=True),
+        patch.dict("tools.mcp_tool._server_scopes", {"toolhive": str(tmp_path / "anton")}, clear=True),
+        patch("tools.mcp_tool.mcp_scope_key", return_value=str(tmp_path / "anton")),
+        patch("tools.mcp_tool.mcp_servers_in_scope", return_value=set()),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+    ):
+        result = await runner._execute_mcp_reload(_make_event())
+
+    assert "anton" in result
+    assert calls == [("shutdown", str(tmp_path / "anton"), set())]
+
+
+@pytest.mark.asyncio
+async def test_refresh_profile_agent_tools_does_not_touch_other_profile(monkeypatch):
+    """Refreshing Anton cannot replace a different profile's snapshot."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    import threading
+
+    runner._agent_cache = OrderedDict()
+    runner._agent_cache_lock = threading.Lock()
+    anton = SimpleNamespace(tools=["old-a"], valid_tool_names={"old-a"})
+    carol = SimpleNamespace(tools=["old-c"], valid_tool_names={"old-c"})
+    runner._agent_cache["agent:anton:matrix:dm:a"] = (anton, "a")
+    runner._agent_cache["agent:carol:matrix:dm:c"] = (carol, "c")
+    runner._is_session_running = MagicMock(return_value=False)
+
+    with patch(
+        "tools.mcp_tool.refresh_agent_mcp_tools",
+        side_effect=lambda agent, quiet_mode=True: agent.tools.__setitem__(0, "new") or True,
+    ) as refresh:
+        refreshed, skipped = runner._refresh_profile_agent_tools("anton")
+
+    assert (refreshed, skipped) == (1, 0)
+    assert anton.tools == ["new"]
+    assert carol.tools == ["old-c"]
+    refresh.assert_called_once_with(anton, quiet_mode=True)
+
+
+@pytest.mark.asyncio
+async def test_refresh_profile_agent_tools_skips_active_turn():
+    """Reload does not mutate an agent while it is in a live turn."""
+    from gateway.run import GatewayRunner
+    import threading
+
+    runner = object.__new__(GatewayRunner)
+    runner._agent_cache = OrderedDict()
+    runner._agent_cache_lock = threading.Lock()
+    agent = SimpleNamespace(tools=["old"], valid_tool_names={"old"})
+    runner._agent_cache["agent:anton:matrix:dm:a"] = (agent, "a")
+    runner._is_session_running = MagicMock(return_value=True)
+
+    with patch("tools.mcp_tool.refresh_agent_mcp_tools") as refresh:
+        refreshed, skipped = runner._refresh_profile_agent_tools("anton")
+
+    assert (refreshed, skipped) == (0, 1)
+    assert agent.tools == ["old"]
+    refresh.assert_not_called()

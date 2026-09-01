@@ -1087,6 +1087,27 @@ def _session_key_namespace(profile: Optional[str]) -> str:
     return f"agent:{profile}"
 
 
+def session_key_profile(session_key: str) -> Optional[str]:
+    """Inverse of :func:`_session_key_namespace`: which profile owns a key.
+
+    Returns ``None`` for the default profile (the ``agent:main`` namespace) and
+    for anything that is not a session key, so it can be compared directly
+    against a normalized profile name where ``None`` means "default".
+
+    Used by profile-scoped operations that have to act on one profile's
+    sessions only — ``/reload-mcp`` rebuilds just the calling profile's cached
+    agent tool snapshots, because the tools it rediscovered came from that
+    profile's config and mean nothing to the others.
+    """
+    if not isinstance(session_key, str):
+        return None
+    parts = session_key.split(":", 2)
+    if len(parts) < 2 or parts[0] != "agent":
+        return None
+    namespace = parts[1]
+    return None if namespace in ("", "main") else namespace
+
+
 def build_session_key(
     source: SessionSource,
     group_sessions_per_user: bool = True,

@@ -114,7 +114,7 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
-from typing import Any, Coroutine, Dict, List, Optional, Set, Tuple
+from typing import Any, Coroutine, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from tools.registry import (
@@ -4566,6 +4566,118 @@ _connect_server_claim: contextvars.ContextVar[
     Optional[Callable[[MCPServerTask], None]]
 ] = contextvars.ContextVar("mcp_connect_server_claim", default=None)
 
+# ---------------------------------------------------------------------------
+# Profile scope ownership
+# ---------------------------------------------------------------------------
+# ``_servers`` is one flat, process-global namespace, but a multiplexed gateway
+# serves several profiles out of a SINGLE process and each profile has its own
+# ``config.yaml`` -> ``mcp_servers`` block.  With no record of who registered
+# what, a ``/reload-mcp`` issued from profile A ran the process-wide
+# ``shutdown_mcp_servers()`` -- which clears the entire registry -- and then
+# rediscovered from whatever HERMES_HOME happened to be process-global.  That
+# tore down profile B's servers and left A serving B's tool set.
+#
+# So every server name that reaches the registry is tagged with the profile
+# home whose config produced it, and ``shutdown_mcp_servers(scope=...)`` tears
+# down exactly one profile's registrations.  Single-profile installs only ever
+# have one scope, and their callers pass ``scope=None``, so nothing changes for
+# them.
+_server_scopes: Dict[str, str] = {}
+
+
+def mcp_scope_key(profile_home=None) -> str:
+    """Canonical identity of the profile that owns a registry entry.
+
+    Delegates to :func:`hermes_constants.hermes_home_key`, the same key every
+    other profile-scoped runtime registry uses (``tools.registry``,
+    ``gateway.platform_registry``, the provider registries), so two of them can
+    never disagree about whether a home is one profile or two — it normcases,
+    which a bare ``realpath`` does not, and a case-different spelling of the
+    same home on Windows would otherwise look like a foreign profile and make a
+    scoped teardown reap nothing.
+
+    ``None`` resolves the HERMES_HOME bound on the *calling context*, so code
+    running inside a profile scope (``gateway.run._profile_runtime_scope``,
+    ``set_hermes_home_override``) gets that profile's key without plumbing the
+    path through.  An unresolvable home degrades to ``""`` — one shared legacy
+    scope, i.e. exactly the pre-multiplex behaviour.
+    """
+    try:
+        from hermes_constants import hermes_home_key
+
+        return hermes_home_key(profile_home)
+    except Exception:
+        return ""
+
+
+def current_mcp_scope() -> str:
+    """Scope key for the HERMES_HOME bound on the calling context."""
+    return mcp_scope_key(None)
+
+
+def mcp_scope_owner(server_name: str) -> Optional[str]:
+    """Scope key that owns ``server_name``, or ``None`` when unregistered."""
+    with _lock:
+        return _server_scopes.get(server_name)
+
+
+def mcp_servers_in_scope(scope: Optional[str] = None) -> Set[str]:
+    """Registered server names owned by ``scope`` (default: current scope)."""
+    if scope is None:
+        scope = current_mcp_scope()
+    with _lock:
+        return {name for name, owner in _server_scopes.items() if owner == scope}
+
+
+def mcp_scope_conflicts(names, scope: Optional[str] = None) -> Dict[str, str]:
+    """``{name: owning_scope}`` for ``names`` another profile already owns.
+
+    A flat registry cannot hold two servers under the same name, so a profile
+    that configures a name a different profile registered first silently gets
+    the other profile's tools.  Callers report the conflict rather than
+    presenting it as a server of their own that connected.
+    """
+    if scope is None:
+        scope = current_mcp_scope()
+    with _lock:
+        conflicts = {}
+        for name in names:
+            owner = _server_scopes.get(name)
+            if owner is not None and owner != scope:
+                conflicts[name] = owner
+        return conflicts
+
+
+def mcp_configured_server_names() -> Set[str]:
+    """Enabled ``mcp_servers`` names in the CALLING context's profile config.
+
+    Reads ``config.yaml`` through the same ``get_hermes_home()`` seam discovery
+    uses, so under ``_profile_runtime_scope`` this is that profile's server set.
+    Servers turned off with ``enabled: false`` are excluded: a scoped reload
+    neither retries them nor reports them as owned by someone else.
+    """
+    return {
+        name
+        for name, cfg in (_load_mcp_config() or {}).items()
+        if _parse_boolish(cfg.get("enabled", True), default=True)
+    }
+
+
+def _claim_scope_ownership(names, scope: str) -> None:
+    """Tag every name that actually reached the registry with ``scope``.
+
+    First owner wins: a name another profile already registered keeps its
+    original owner, so a second profile's discovery pass can never take over —
+    and therefore can never tear down — servers it does not own.  Names that
+    failed to connect are not claimed, which leaves them free for a profile
+    whose config for that server actually works.
+    """
+    with _lock:
+        for name in names:
+            if name in _servers or name in _lazy_server_configs:
+                _server_scopes.setdefault(name, scope)
+
+
 # Connection-retry cooldown (per-server isolation against restart storms).
 #
 # A single stdio MCP server that fails to spawn (bad PATH, ``exec: not
@@ -7867,12 +7979,30 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     Idempotent for already-connected server names. Servers with
     ``enabled: false`` are skipped without disconnecting existing sessions.
 
+    Records profile-scope ownership for everything that actually landed in the
+    registry (see :func:`_claim_scope_ownership`) so a later profile-scoped
+    reload tears down only the servers this profile's config produced.  The
+    scope is captured on the CALLING thread, before any work is scheduled onto
+    the MCP loop, so it is the caller's bound HERMES_HOME that gets recorded.
+
     Args:
         servers: Mapping of ``{server_name: server_config}``.
 
     Returns:
         List of all currently registered MCP tool names.
     """
+    scope = current_mcp_scope()
+    try:
+        return _register_mcp_servers(servers)
+    finally:
+        # In ``finally`` on purpose: discovery can raise (outer timeout, user
+        # interrupt) after some servers already connected, and an unclaimed
+        # server is one a scoped shutdown would refuse to reap.
+        _claim_scope_ownership(list(servers or {}), scope)
+
+
+def _register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
+    """Connect + register, without recording scope ownership."""
     if not _ensure_mcp_sdk():
         logger.debug("MCP SDK not available -- skipping explicit MCP registration")
         return []
@@ -8575,18 +8705,148 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
     return staged_engine_names
 
 
-def shutdown_mcp_servers():
-    """Close all MCP server connections and stop the background loop.
+def _await_server_shutdowns(servers, log_message: str, on_complete=None) -> None:
+    """Run ``shutdown()`` for ``servers`` on the MCP loop and wait for it.
+
+    ``on_complete`` runs on the loop thread after every shutdown resolves, so
+    a caller that must only drop registry state when the teardown really
+    finished can hang that off the same task.  No-op when the loop is already
+    gone: the tasks that owned those sessions died with it.
+    """
+    async def _shutdown():
+        results = await asyncio.gather(
+            *(server.shutdown() for server in servers),
+            return_exceptions=True,
+        )
+        for server, result in zip(servers, results):
+            if isinstance(result, Exception):
+                logger.debug(
+                    "Error closing MCP server '%s': %s", server.name, result,
+                )
+        if on_complete is not None:
+            on_complete()
+
+    with _lock:
+        loop = _mcp_loop
+    if loop is None or not loop.is_running():
+        return
+    from agent.async_utils import safe_schedule_threadsafe
+
+    future = safe_schedule_threadsafe(
+        _shutdown(), loop, logger=logger, log_message=log_message,
+    )
+    if future is not None:
+        try:
+            future.result(timeout=15)
+        except BaseException as exc:
+            logger.debug("Error during MCP shutdown: %s", exc)
+
+
+def _deregister_lazy_server_tools(name: str) -> None:
+    """Unpublish a lazily-registered (schema-cache) server's tools.
+
+    Lazy servers have no ``MCPServerTask``, so nothing runs
+    ``_deregister_tools`` for them — their tools live in the registry alone.
+    A scoped teardown has to unpublish them by hand, or the profile keeps
+    advertising the very tools it asked to rebuild.
+    """
+    from tools.registry import registry
+
+    with _lock:
+        tool_names = list(_lazy_server_tool_names.get(name, ()))
+    for tool_name in tool_names:
+        try:
+            registry.deregister(tool_name)
+        except Exception:
+            logger.debug("Failed to deregister lazy MCP tool %r", tool_name)
+        _forget_mcp_tool_server(tool_name)
+    with _lock:
+        _lazy_server_configs.pop(name, None)
+        _lazy_server_fingerprints.pop(name, None)
+        _lazy_server_tool_names.pop(name, None)
+
+
+def _shutdown_mcp_servers_in_scope(
+    scope: str, reset_cooldown_for: Optional[Iterable[str]] = None,
+) -> List[str]:
+    """Tear down exactly one profile's MCP registrations.
+
+    Everything another profile owns keeps its session, its tools stay in the
+    registry, and the shared MCP loop is stopped only if nothing is left on
+    it. Returns the server names that were dropped.
+    """
+    with _lock:
+        owned = sorted(name for name, owner in _server_scopes.items() if owner == scope)
+        live = [_servers[name] for name in owned if name in _servers]
+        lazy = [name for name in owned if name in _lazy_server_configs]
+
+    if live:
+        _await_server_shutdowns(live, "MCP scoped shutdown: failed to schedule")
+    for name in lazy:
+        _deregister_lazy_server_tools(name)
+
+    # A server that FAILED to connect is never recorded in ``_servers`` (that
+    # is the premise of the #50394 cooldown), so it is never scope-claimed and
+    # is not in ``owned`` -- yet its backoff is exactly what an explicit reload
+    # exists to clear, because the user just edited the config that broke it.
+    # The process-wide teardown clears the maps outright; the scoped one gets
+    # the caller's configured names instead. A cleared name can only be shared
+    # with another profile when BOTH configure it and neither could connect it,
+    # in which case both are equally entitled to the retry.
+    cooldown_names = set(owned)
+    if reset_cooldown_for:
+        cooldown_names.update(reset_cooldown_for)
+
+    # Drop the registry state whether or not the async teardown got to run:
+    # a name left behind is one the following discovery pass skips as
+    # "already connected", so the profile would come back with the stale
+    # snapshot it just asked to rebuild.  Cooldown/error entries go too, so
+    # the rediscovery re-attempts every server immediately (#50394) and no
+    # stale "connecting"/"failed" row survives into the next status read.
+    with _lock:
+        for name in owned:
+            _servers.pop(name, None)
+            _server_scopes.pop(name, None)
+            _server_connecting.discard(name)
+            _parallel_safe_servers.discard(name)
+        for name in cooldown_names:
+            _server_connect_errors.pop(name, None)
+            _server_connect_retry_after.pop(name, None)
+            _server_connect_failures.pop(name, None)
+
+    _stop_mcp_loop(only_if_idle=True)
+    return owned
+
+
+def shutdown_mcp_servers(
+    *,
+    scope: Optional[str] = None,
+    reset_cooldown_for: Optional[Iterable[str]] = None,
+) -> List[str]:
+    """Close MCP server connections and stop the background loop.
 
     Each server Task is signalled to exit its ``async with`` block so that
     the anyio cancel-scope cleanup happens in the same Task that opened it.
     All servers are shut down in parallel via ``asyncio.gather``.
+
+    ``scope`` (a key from :func:`mcp_scope_key`) restricts the teardown to the
+    servers that ONE profile registered — the multiplexed ``/reload-mcp`` path,
+    where clearing the whole registry would disconnect every other profile.
+    The default ``None`` is the process-wide teardown used at shutdown and by
+    single-profile callers; it is unchanged.
+
+    ``reset_cooldown_for`` additionally drops connect-cooldown/error state for
+    names the scoped teardown cannot reach because they never connected (see
+    :func:`mcp_configured_server_names`).  Ignored without ``scope``: the
+    process-wide path already clears those maps outright.
+
+    Returns the server names that were torn down.
     """
-    # Process-level teardown: sweep EVERY profile's registry, not just the
-    # ambient one. In a multiplexed gateway the shutdown hook runs with
-    # whatever profile scope happens to be current (often none), so scoping
-    # this to one registry would strand every other profile's live sessions
-    # and stdio subprocesses.
+    if scope is not None:
+        return _shutdown_mcp_servers_in_scope(scope, reset_cooldown_for)
+
+    # Process-level teardown sweeps every profile registry. A normal gateway
+    # shutdown must not strand servers owned by a non-ambient profile.
     registries = _mcp_profile.all_registries()
 
     def _clear_cooldowns() -> None:
@@ -8599,6 +8859,7 @@ def shutdown_mcp_servers():
         servers_snapshot = [
             server for reg in registries for server in reg.servers.values()
         ]
+        names = [server.name for server in servers_snapshot]
 
     # Fast path: nothing to shut down. The connect-cooldown maps can still
     # be populated here — a server that failed to connect is never recorded
@@ -8609,18 +8870,9 @@ def shutdown_mcp_servers():
     if not servers_snapshot:
         _clear_cooldowns()
         _stop_mcp_loop()
-        return
+        return names
 
-    async def _shutdown():
-        results = await asyncio.gather(
-            *(server.shutdown() for server in servers_snapshot),
-            return_exceptions=True,
-        )
-        for server, result in zip(servers_snapshot, results):
-            if isinstance(result, Exception):
-                logger.debug(
-                    "Error closing MCP server '%s': %s", server.name, result,
-                )
+    def _drop_registry_state():
         with _lock:
             for reg in registries:
                 reg.servers.clear()
@@ -8630,28 +8882,20 @@ def shutdown_mcp_servers():
                 reg.server_connect_retry_after.clear()
                 reg.server_connect_failures.clear()
 
-    with _lock:
-        loop = _mcp_loop
-    if loop is not None and loop.is_running():
-        from agent.async_utils import safe_schedule_threadsafe
-        future = safe_schedule_threadsafe(
-            _shutdown(), loop,
-            logger=logger,
-            log_message="MCP shutdown: failed to schedule",
-        )
-        if future is not None:
-            try:
-                future.result(timeout=15)
-            except BaseException as exc:
-                logger.debug("Error during MCP shutdown: %s", exc)
+    _await_server_shutdowns(
+        servers_snapshot,
+        "MCP shutdown: failed to schedule",
+        on_complete=_drop_registry_state,
+    )
 
-    # Unconditional final sweep: whether the async ``_shutdown`` ran,
+    # Unconditional final sweep: whether the async shutdown ran,
     # timed out, or was never scheduled (loop already stopped), a full
     # shutdown must leave no stale connect-cooldown state behind — the
     # next start should re-attempt every server immediately (#50394).
     _clear_cooldowns()
 
     _stop_mcp_loop()
+    return names
 
 
 def _kill_orphaned_mcp_children(
