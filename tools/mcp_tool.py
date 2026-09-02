@@ -4616,36 +4616,37 @@ def current_mcp_scope() -> str:
 
 
 def mcp_scope_owner(server_name: str) -> Optional[str]:
-    """Scope key that owns ``server_name``, or ``None`` when unregistered."""
+    """Return the active profile scope containing ``server_name``."""
     with _lock:
-        return _server_scopes.get(server_name)
+        scope = current_mcp_scope()
+        if server_name in _servers or server_name in _lazy_server_configs:
+            return scope
+    return None
+
+
+def _registry_for_scope(scope: str):
+    """Return the v5 profile registry identified by a canonical scope."""
+    return _mcp_profile.registry_for_key(scope, scope)
 
 
 def mcp_servers_in_scope(scope: Optional[str] = None) -> Set[str]:
-    """Registered server names owned by ``scope`` (default: current scope)."""
+    """Registered server names in one v5 profile registry."""
     if scope is None:
         scope = current_mcp_scope()
+    reg = _registry_for_scope(scope)
     with _lock:
-        return {name for name, owner in _server_scopes.items() if owner == scope}
+        return set(reg.servers) | set(reg.lazy_server_configs)
 
 
 def mcp_scope_conflicts(names, scope: Optional[str] = None) -> Dict[str, str]:
-    """``{name: owning_scope}`` for ``names`` another profile already owns.
+    """Return no conflicts: v5 registries allow shared logical names.
 
-    A flat registry cannot hold two servers under the same name, so a profile
-    that configures a name a different profile registered first silently gets
-    the other profile's tools.  Callers report the conflict rather than
-    presenting it as a server of their own that connected.
+    The same MCP server name may be used by multiple profiles, each with
+    different credentials and tool catalogs. v5 stores those connections in
+    separate ``MCPProfileRegistry`` objects, so a process-global name collision
+    is not a conflict.
     """
-    if scope is None:
-        scope = current_mcp_scope()
-    with _lock:
-        conflicts = {}
-        for name in names:
-            owner = _server_scopes.get(name)
-            if owner is not None and owner != scope:
-                conflicts[name] = owner
-        return conflicts
+    return {}
 
 
 def mcp_configured_server_names() -> Set[str]:
@@ -8775,44 +8776,32 @@ def _shutdown_mcp_servers_in_scope(
     registry, and the shared MCP loop is stopped only if nothing is left on
     it. Returns the server names that were dropped.
     """
+    reg = _registry_for_scope(scope)
     with _lock:
-        owned = sorted(name for name, owner in _server_scopes.items() if owner == scope)
-        live = [_servers[name] for name in owned if name in _servers]
-        lazy = [name for name in owned if name in _lazy_server_configs]
+        owned = sorted(set(reg.servers) | set(reg.lazy_server_configs))
+        live = [reg.servers[name] for name in owned if name in reg.servers]
+        lazy = [name for name in owned if name in reg.lazy_server_configs]
 
     if live:
         _await_server_shutdowns(live, "MCP scoped shutdown: failed to schedule")
-    for name in lazy:
-        _deregister_lazy_server_tools(name)
+    if lazy:
+        with _mcp_profile.profile_scope(reg.home):
+            for name in lazy:
+                _deregister_lazy_server_tools(name)
 
-    # A server that FAILED to connect is never recorded in ``_servers`` (that
-    # is the premise of the #50394 cooldown), so it is never scope-claimed and
-    # is not in ``owned`` -- yet its backoff is exactly what an explicit reload
-    # exists to clear, because the user just edited the config that broke it.
-    # The process-wide teardown clears the maps outright; the scoped one gets
-    # the caller's configured names instead. A cleared name can only be shared
-    # with another profile when BOTH configure it and neither could connect it,
-    # in which case both are equally entitled to the retry.
     cooldown_names = set(owned)
     if reset_cooldown_for:
         cooldown_names.update(reset_cooldown_for)
 
-    # Drop the registry state whether or not the async teardown got to run:
-    # a name left behind is one the following discovery pass skips as
-    # "already connected", so the profile would come back with the stale
-    # snapshot it just asked to rebuild.  Cooldown/error entries go too, so
-    # the rediscovery re-attempts every server immediately (#50394) and no
-    # stale "connecting"/"failed" row survives into the next status read.
     with _lock:
         for name in owned:
-            _servers.pop(name, None)
-            _server_scopes.pop(name, None)
-            _server_connecting.discard(name)
-            _parallel_safe_servers.discard(name)
+            reg.servers.pop(name, None)
+            reg.server_connecting.discard(name)
+            reg.parallel_safe_servers.discard(name)
         for name in cooldown_names:
-            _server_connect_errors.pop(name, None)
-            _server_connect_retry_after.pop(name, None)
-            _server_connect_failures.pop(name, None)
+            reg.server_connect_errors.pop(name, None)
+            reg.server_connect_retry_after.pop(name, None)
+            reg.server_connect_failures.pop(name, None)
 
     _stop_mcp_loop(only_if_idle=True)
     return owned
