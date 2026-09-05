@@ -3641,6 +3641,16 @@ class MCPServerTask:
             except Exception as exc:
                 logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
                 raise
+        elif self._auth_type == "service_account":
+            try:
+                from tools.mcp_service_account import build_service_account_auth
+                sa_cfg = config.get("service_account") or {}
+                _oauth_auth = build_service_account_auth(self.name, sa_cfg)
+            except Exception as exc:
+                logger.warning(
+                    "MCP service-account setup failed for '%s': %s", self.name, exc
+                )
+                raise
 
         sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}
         if self._elicitation:

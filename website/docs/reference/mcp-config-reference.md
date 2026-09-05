@@ -64,7 +64,8 @@ mcp_servers:
 | `idle_timeout_seconds` | number | stdio | Optional stdio server recycle after idle time (`0` disables). May also live under a `lifecycle:` mapping |
 | `max_lifetime_seconds` | number | stdio | Optional stdio server recycle after age (`0` disables). May also live under a `lifecycle:` mapping |
 | `tools` | mapping | both | Filtering and utility-tool policy |
-| `auth` | string | HTTP | Authentication method. Set to `oauth` to enable OAuth 2.1 with PKCE |
+| `auth` | string | HTTP | Authentication method. `oauth` = OAuth 2.1 PKCE (browser login). `service_account` = machine-to-machine token exchange, strategy chosen by `service_account.grant_type` (see below). |
+| `service_account` | mapping | HTTP | Service-account config block (required when `auth: service_account`). See `service_account` sub-keys below. |
 | `sampling` | mapping | both | Server-initiated LLM request policy (see MCP guide) |
 | `elicitation` | mapping | both | Server-initiated user-input requests. `enabled` (default `true`) and `timeout` in seconds (default `300`). Form-mode requests route through the approval surface; URL-mode is declined (see MCP guide) |
 | `trust` | string | both | Trust tier: `full` (default) or `untrusted`. On an `untrusted` server, every write-capable tool call (any tool without a `readOnlyHint: true` annotation) requires user approval through the standard approval surface before it runs. `readOnlyHint` is a server-supplied *hint* — a lying server can at most skip approval for tools it claims are read-only, never gain extra access — so mark any server you don't fully control as `untrusted`. Unrecognized values are treated as `untrusted` (fail-closed) |
@@ -378,6 +379,93 @@ mcp_servers:
 `client_metadata_url` must be an HTTPS URL with a path (no bare origin, no fragment, no userinfo, no `.`/`..` segments) that returns `200` and `Content-Type: application/json` with **no redirect** — authorization servers are forbidden from following redirects when fetching it. Hermes still pins its callback to the same `27890`–`27894` range, so a self-hosted document must declare all ten loopback URIs (`http://127.0.0.1:<port>/callback` and `http://localhost:<port>/callback` for each port), and its `client_id` must be its own URL.
 
 `user_agent` replaces the HTTP library's default `User-Agent` on **token-endpoint requests only** (authorization-code exchange and refresh) — some authorization servers and WAFs reject the default `python-httpx/...` value there. It never applies to MCP traffic or OAuth discovery, and no other token-request headers are configurable. Empty or null values are ignored.
+
+## Service-account (M2M) authentication
+
+For HTTP MCP servers that authenticate machine identities rather than human users, use `auth: service_account`. This is distinct from `auth: oauth` (which opens a browser window for user login) — no browser interaction is needed. Hermes exchanges a long-lived service-account credential for a short-lived Bearer access token and renews it automatically.
+
+The grant strategy is selected explicitly by `service_account.grant_type` and is never inferred from which fields you happen to set. One strategy is implemented today:
+
+| `grant_type` | What it does |
+|---|---|
+| `authentik_app_password` | Authentik's service-account extension: posts `grant_type=client_credentials` **plus** a resource-owner `username`/`password` pair. |
+
+:::caution Not a generic client-credentials client
+`authentik_app_password` is a provider extension that reuses the `client_credentials` wire name. It is **not** the RFC 6749 §4.4.2 client-credentials request, which carries no username or password. Identity providers whose M2M flow is plain client authentication — Keycloak service accounts, Auth0 M2M — do not work with this strategy. Support for a standards-conforming `client_credentials` strategy would be an additive change; for those providers today, use a static token via `headers:` instead.
+:::
+
+```yaml
+mcp_servers:
+  toolhive:
+    url: https://mcp.example.com/mcp
+    auth: service_account
+    service_account:
+      grant_type: authentik_app_password         # required — no default
+      token_url: https://idp.example.com/application/o/toolhive/token/
+      client_id: toolhive
+      username: zug
+      password_env: AUTHENTIK_ZUG_APP_PASSWORD   # env-var NAME, not the value
+      scope: "openid profile groups toolhive-audience"
+      client_secret_env: MY_CLIENT_SECRET        # optional
+```
+
+**Secret values must never appear in `config.yaml`**. Only environment-variable *names* belong in the config. The values are resolved at runtime through the active profile's secret scope, falling back to the process environment, which is populated from `$HERMES_HOME/.env` before any MCP connection is made. In a multi-profile process each profile resolves its own value, so two profiles can use the same env-var name for different credentials. Put the actual secrets there:
+
+```sh
+# ~/.hermes/.env  (or the active profile's .env)
+AUTHENTIK_ZUG_APP_PASSWORD=your-app-password-here
+```
+
+### `service_account` sub-keys
+
+| Key | Required | Meaning |
+|---|---|---|
+| `grant_type` | yes | Grant strategy. Only `authentik_app_password` is supported; there is no default |
+| `token_url` | yes | OAuth token endpoint URL. **`https://` is required** for any host reachable over a network, and enforced twice — at config validation and again immediately before every token request. Plain `http://` is accepted only for loopback (`localhost`, `127.0.0.1`, `::1`), which never leaves the machine; it logs a warning on every exchange and is meant for local development IdPs only |
+| `client_id` | yes | Client ID registered at the IdP |
+| `username` | yes | Service-account username (`authentik_app_password` only) |
+| `password_env` | yes | Name of the environment variable holding the password (`authentik_app_password` only) |
+| `scope` | no | Space-separated OAuth scopes to request |
+| `client_secret_env` | no | Name of the environment variable holding the optional client secret |
+
+### Behavior
+
+- Tokens are cached at `$HERMES_HOME/mcp-tokens/service-account/<server>-<digest>.json` (mode `0600`, atomic write). The path is rooted at the profile's own home, so two profiles configuring the same server name never share a token.
+- A cached token is **bound to the identity that minted it** — `grant_type`, `token_url`, `client_id`, `username`, `scope` and the credential env-var *names*. Change any of them and the cached token is discarded and re-minted instead of being presented for the previous identity. Only env-var names are hashed; no secret value is.
+- A valid token is reused across reconnects; a new token is fetched proactively 60 seconds before expiry, or at half the token's lifetime when the server issues one shorter than 120 seconds.
+- If the server returns a `refresh_token`, Hermes uses it on the next renewal before falling back to a fresh service-account exchange. A refresh response that omits `refresh_token` means "keep the one you have" (RFC 6749 §6) and the existing one is retained.
+- A single `401` response triggers one immediate re-fetch; if the re-fetch also fails, the error is surfaced to the model.
+- Concurrent requests share a single in-process lock so only one token exchange fires at a time.
+- Passwords and access tokens are never logged or written to `config.yaml`.
+- TLS verification is always on; there is no option to disable it for service-account auth.
+- **Token-endpoint redirects are not followed.** A `307`/`308` preserves the method and body, so following one would replay the password — and the client secret — at an origin your config never authorised. Any `3xx` from `token_url` is reported as an error; point `token_url` at the authorization server's final token endpoint.
+
+### Credential rotation
+
+The password is read from the environment on every token exchange, but editing `$HERMES_HOME/.env` does **not** change an already-running process's environment. Rotating a service-account password therefore requires restarting Hermes (or the gateway); automatic token renewal renews the *access token*, not the source credential. Until the restart, renewal and reconnect keep presenting the old password.
+
+### Setting up via CLI
+
+```sh
+# 1. Set the secret in your profile's .env
+echo 'AUTHENTIK_ZUG_APP_PASSWORD=my-app-password' >> ~/.hermes/.env
+
+# 2. Add the server with auth: service_account already in config.yaml,
+#    then validate and probe it
+hermes mcp add toolhive \
+  --url https://mcp.example.com/mcp \
+  --auth service_account
+```
+
+Because the password is read from an environment variable, `hermes mcp add` will validate the config and report any missing env-var names without ever prompting for or storing the secret itself.
+
+### Comparison with other auth modes
+
+| Mode | When to use |
+|---|---|
+| `auth: oauth` | Human user login via browser (PKCE). IdP manages sessions. |
+| `auth: service_account` | Machine identity (M2M) against Authentik. Long-lived app password exchanged for short-lived Bearer token. No browser. |
+| `headers:` with `${VAR}` | Static API key injected directly (no exchange, no expiry). |
 
 ## Add to Hermes link
 
