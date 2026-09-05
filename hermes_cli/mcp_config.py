@@ -534,6 +534,31 @@ def cmd_mcp_add(args):
                 _info("Cancelled.")
                 return
 
+    elif url and auth_type == "service_account":
+        # Service-account M2M: validate the sub-block; secrets stay in env vars.
+        print()
+        _info(f"Configuring service-account auth for '{name}'...")
+        sa_cfg = server_config.get("service_account") or {}
+        from tools.mcp_service_account import validate_service_account_config
+        sa_errors = validate_service_account_config(name, sa_cfg)
+        if sa_errors:
+            for err in sa_errors:
+                _warning(err)
+            _warning(
+                "Fix the service_account block in config.yaml and re-run. "
+                "Secrets must be in environment variables, not in config."
+            )
+            return
+        server_config["auth"] = "service_account"
+        _success(
+            f"Service-account auth configured — token will be acquired from "
+            f"{sa_cfg.get('token_url', '(token_url)')} on first connection"
+        )
+        _info(
+            f"Ensure ${sa_cfg.get('password_env', 'PASSWORD_ENV')} is set "
+            "in your shell or in $HERMES_HOME/.env before connecting."
+        )
+
     elif url:
         # Prompt for API key / Bearer token for HTTP servers
         print()
@@ -668,6 +693,13 @@ def cmd_mcp_remove(args):
         from tools.mcp_oauth_manager import get_manager
         get_manager().remove(name)
         _success("Cleaned up OAuth tokens")
+    except Exception:
+        pass
+
+    # Clean up service-account token cache if present.
+    try:
+        from tools.mcp_service_account import remove_service_account_tokens
+        remove_service_account_tokens(name)
     except Exception:
         pass
 
